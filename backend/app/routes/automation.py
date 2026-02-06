@@ -517,8 +517,9 @@ async def check_ready_state():
                 has_frame = True
                 break
 
-        # 检测登录状态（通过 API）
+        # 检测登录状态（通过 API + DOM 双重验证）
         try:
+            # 方法1：通过 API 检测
             api_url = "https://www.zhipin.com/wapi/zpboss/h5/user/info"
             response = await page.evaluate(f'''
                 async () => {{
@@ -531,36 +532,80 @@ async def check_ready_state():
                 }}
             ''')
 
+            logger.info(f"🔍 check-ready-state API 响应 code={response.get('code')}")
+
             if response.get('code') == 0:
-                logged_in = True
-                _automation_service.is_logged_in = True
                 zp_data = response.get('zpData', {})
                 base_info = zp_data.get('baseInfo', {})
-                user_info = {
-                    'comId': base_info.get('comId'),
-                    'name': base_info.get('name'),
-                    'showName': base_info.get('showName'),
-                    'avatar': base_info.get('avatar'),
-                    'title': base_info.get('title'),
-                }
-
-                # 如果是新登录，保存认证状态
                 com_id = base_info.get('comId')
-                if com_id and not _automation_service.auth_file:
-                    _automation_service.current_com_id = com_id
-                    _automation_service.auth_file = _automation_service.get_auth_file_path(com_id)
 
-                if _automation_service.auth_file:
+                # 必须有实际用户数据（comId）才算真正登录
+                if com_id:
+                    logged_in = True
+                    _automation_service.is_logged_in = True
+                    user_info = {
+                        'comId': com_id,
+                        'name': base_info.get('name'),
+                        'showName': base_info.get('showName'),
+                        'avatar': base_info.get('avatar'),
+                        'title': base_info.get('title'),
+                    }
+                    logger.info(f"✅ API 验证已登录: {base_info.get('showName')} (comId={com_id})")
+
+                    # 如果是新登录，保存认证状态
+                    if not _automation_service.auth_file:
+                        _automation_service.current_com_id = com_id
+                        _automation_service.auth_file = _automation_service.get_auth_file_path(com_id)
+
+                    if _automation_service.auth_file:
+                        try:
+                            await _automation_service.context.storage_state(path=_automation_service.auth_file)
+                        except Exception:
+                            pass
+
+                    # 保存账号信息到数据库
                     try:
-                        await _automation_service.context.storage_state(path=_automation_service.auth_file)
+                        await _automation_service._save_account_info(response)
                     except Exception:
                         pass
+                else:
+                    logger.info("⚠️ API 返回 code=0 但无 comId，判定为未登录")
 
-                # 保存账号信息到数据库
+            # 方法2：如果 API 判定未登录，再通过 DOM 检查页面上是否有登录按钮
+            if not logged_in:
                 try:
-                    await _automation_service._save_account_info(response)
-                except Exception:
-                    pass
+                    login_btn = await page.query_selector('#header .user-nav a[href*="login"], #header .user-nav a[ka*="login"]')
+                    if login_btn:
+                        logger.info("🔍 DOM 检测到登录按钮，确认未登录")
+                    else:
+                        # 没有登录按钮 + 不在登录页面 = 可能已登录但 API 失败
+                        if 'zhipin.com/web/user/' not in current_url:
+                            logger.info("🔍 DOM 未找到登录按钮且不在登录页，尝试备用 API")
+                            # 尝试备用 API
+                            backup_response = await page.evaluate('''
+                                async () => {
+                                    try {
+                                        const response = await fetch("https://www.zhipin.com/wapi/zpuser/wap/getUserInfo.json");
+                                        return await response.json();
+                                    } catch(e) {
+                                        return { code: -1 };
+                                    }
+                                }
+                            ''')
+                            if backup_response.get('code') == 0:
+                                backup_data = backup_response.get('zpData', {})
+                                if backup_data.get('userId'):
+                                    logged_in = True
+                                    _automation_service.is_logged_in = True
+                                    user_info = {
+                                        'comId': backup_data.get('comId'),
+                                        'name': backup_data.get('name'),
+                                        'showName': backup_data.get('showName'),
+                                        'avatar': backup_data.get('largeAvatar'),
+                                    }
+                                    logger.info(f"✅ 备用 API 验证已登录: {backup_data.get('showName')}")
+                except Exception as dom_err:
+                    logger.warning(f"⚠️ DOM 检测失败: {str(dom_err)}")
         except Exception as e:
             logger.warning(f"⚠️ 检查登录状态失败: {str(e)}")
 

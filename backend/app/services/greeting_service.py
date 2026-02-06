@@ -474,51 +474,41 @@ class GreetingTaskManager:
 
     async def _extract_expected_position(self, card) -> Optional[str]:
         """
-        从候选人卡片提取期望职位
-        Boss直聘 DOM 结构：
-          div.row.row-flex.expect-wrap > span.content > div > span（多个span包含城市、职位等）
+        从候选人卡片提取期望职位（求职期望行的全部文本）
+        直接获取 .expect-wrap 行的完整文本内容，用于关键词匹配
 
         Args:
             card: Playwright locator对象，候选人卡片
 
         Returns:
-            期望职位字符串，如果提取失败则返回None
+            期望职位完整文本，如果提取失败则返回None
         """
         try:
             result = await card.evaluate("""
                 (el) => {
-                    // 新版DOM结构: .row-flex.expect-wrap > span.content > div > span
-                    let contentEl = el.querySelector('.row-flex.expect-wrap span.content');
-                    if (contentEl) {
-                        // 获取所有 span 文本（通常包含城市、职位等）
-                        const spans = contentEl.querySelectorAll('span');
-                        if (spans.length > 0) {
-                            // 收集所有 span 文本
+                    // 获取 expect-wrap 行元素
+                    const expectRow = el.querySelector('.row-flex.expect-wrap');
+                    if (expectRow) {
+                        // 获取该行内所有 span.content 元素的文本（可能有多个同级 span.content）
+                        const contentSpans = expectRow.querySelectorAll('span.content');
+                        if (contentSpans.length > 0) {
                             const texts = [];
-                            for (const span of spans) {
+                            for (const span of contentSpans) {
                                 const text = span.textContent.trim();
                                 if (text) texts.push(text);
                             }
-                            // 通常 texts = ["城市", "薪资", "职位"] 或类似排列
-                            // 返回所有文本用 | 分隔，在匹配时逐个检查
-                            return texts.join('|');
+                            if (texts.length > 0) return texts.join('|');
                         }
-                        // 没有 span 子元素，直接取文本
-                        const text = contentEl.textContent.trim();
+                        // 回退：直接取整行文本
+                        const text = expectRow.textContent.trim();
                         if (text) return text;
                     }
 
-                    // 旧版DOM结构回退: .row-flex .content .join-text-wrap
-                    let expectRow = el.querySelector('.row-flex .content .join-text-wrap');
-                    if (expectRow) {
-                        const parts = [];
-                        for (const child of expectRow.childNodes) {
-                            if (child.nodeType === Node.TEXT_NODE) {
-                                const text = child.textContent.trim();
-                                if (text) parts.push(text);
-                            }
-                        }
-                        return parts.length > 1 ? parts[1] : (parts[0] || null);
+                    // 旧版DOM回退: .join-text-wrap
+                    const joinWrap = el.querySelector('.row-flex .content .join-text-wrap');
+                    if (joinWrap) {
+                        const text = joinWrap.textContent.trim();
+                        if (text) return text;
                     }
 
                     return null;

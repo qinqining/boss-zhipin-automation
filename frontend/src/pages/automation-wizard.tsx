@@ -10,7 +10,9 @@ import { toast } from 'sonner';
 
 import { useAutomation } from '@/hooks/useAutomation';
 import { useAutomationTemplates } from '@/hooks/useAutomationTemplates';
+import { useAccounts } from '@/hooks/useAccounts';
 import type { GreetingStatus, GreetingLogEntry } from '@/types';
+import type { UserAccount } from '@/types/account';
 
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -18,6 +20,14 @@ import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
+import { Separator } from '@/components/ui/separator';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import {
   Dialog,
   DialogContent,
@@ -33,6 +43,7 @@ type WizardStep = 'browser' | 'manual' | 'confirm';
 export default function AutomationWizard() {
   const { initBrowser, checkReadyState } = useAutomation();
   const { createTemplate } = useAutomationTemplates();
+  const { getAccounts } = useAccounts();
 
   // 步骤状态
   const [currentStep, setCurrentStep] = useState<WizardStep>('browser');
@@ -46,6 +57,11 @@ export default function AutomationWizard() {
   // 浏览器配置
   const [showBrowser, setShowBrowser] = useState(true); // 默认勾选，因为需要手动操作
   const [browserInitializing, setBrowserInitializing] = useState(false);
+
+  // 账号相关状态
+  const [availableAccounts, setAvailableAccounts] = useState<UserAccount[]>([]);
+  const [selectedComId, setSelectedComId] = useState<string>('');
+  const [accountsLoaded, setAccountsLoaded] = useState(false);
 
   // 手动操作引导 - 就绪状态
   const [readyState, setReadyState] = useState({
@@ -69,16 +85,37 @@ export default function AutomationWizard() {
   const [expectedPositions, setExpectedPositions] = useState<string[]>([]);
   const [positionInput, setPositionInput] = useState('');
 
+  // 页面加载时获取账号列表
+  useEffect(() => {
+    const loadAccounts = async () => {
+      try {
+        const accounts = await getAccounts();
+        setAvailableAccounts(accounts);
+      } catch (error) {
+        console.error('加载账号列表失败:', error);
+      } finally {
+        setAccountsLoaded(true);
+      }
+    };
+    loadAccounts();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   /**
    * 初始化浏览器（手动模式）
    */
   const handleInitBrowser = async () => {
     setBrowserInitializing(true);
     try {
-      const result = await initBrowser(!showBrowser, undefined, true);
+      const comId = selectedComId ? Number(selectedComId) : undefined;
+      const result = await initBrowser(!showBrowser, comId, true);
 
       if (result.success) {
-        toast.success('浏览器已启动，请在浏览器中完成操作');
+        if (comId) {
+          toast.success('浏览器已启动并加载了账号登录状态');
+        } else {
+          toast.success('浏览器已启动，请在浏览器中登录');
+        }
         setCurrentStep('manual');
         // 开始轮询就绪状态
         startReadyStatePolling();
@@ -303,11 +340,63 @@ export default function AutomationWizard() {
           步骤 1: 启动浏览器
         </CardTitle>
         <CardDescription>
-          启动 Playwright 浏览器，用于后续手动操作
+          选择账号并启动浏览器，用于后续手动操作
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
         <div className="space-y-4">
+          {/* 账号选择 */}
+          {accountsLoaded && availableAccounts.length > 0 && (
+            <div className="space-y-2">
+              <Label htmlFor="account-select">选择已保存的账号（可选）</Label>
+              <Select
+                value={selectedComId}
+                onValueChange={(value) => setSelectedComId(value)}
+              >
+                <SelectTrigger id="account-select">
+                  <SelectValue placeholder="不使用已有账号（全新登录）" />
+                </SelectTrigger>
+                <SelectContent>
+                  {availableAccounts.map((account) => (
+                    <SelectItem key={account.id} value={account.com_id.toString()}>
+                      <div className="flex items-center gap-2">
+                        {account.avatar && (
+                          <img
+                            src={account.avatar}
+                            alt={account.show_name}
+                            className="w-5 h-5 rounded-full"
+                          />
+                        )}
+                        <span>{account.show_name}</span>
+                        <span className="text-muted-foreground text-xs">
+                          ({account.company_short_name || account.company_name})
+                        </span>
+                      </div>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {selectedComId
+                  ? '将加载该账号的登录状态（cookies），可能免去手动登录'
+                  : '不选择账号则需要在浏览器中手动登录'}
+              </p>
+
+              {selectedComId && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-xs text-muted-foreground"
+                  onClick={() => setSelectedComId('')}
+                >
+                  清除选择
+                </Button>
+              )}
+
+              <Separator />
+            </div>
+          )}
+
           <div className="flex items-start space-x-3 p-4 border rounded-lg">
             <Checkbox
               id="showBrowser"
@@ -329,16 +418,19 @@ export default function AutomationWizard() {
 
           <div className="bg-blue-50 dark:bg-blue-950 p-4 rounded-lg">
             <h4 className="font-medium text-blue-900 dark:text-blue-100 mb-2">
-              新流程说明
+              流程说明
             </h4>
             <ul className="text-sm text-blue-800 dark:text-blue-200 space-y-1">
-              <li>1. 启动浏览器后，在浏览器中手动完成登录</li>
-              <li>2. 手动进入"推荐牛人"页面、选择职位、设置筛选条件</li>
-              <li>3. 程序检测到就绪后，配置打招呼数量并启动</li>
-              <li>
-                <span className="font-medium">优势：</span>
-                手动操作更可靠，不受网站更新影响
-              </li>
+              {selectedComId ? (
+                <>
+                  <li>1. 启动浏览器并自动加载账号 cookies</li>
+                  <li>2. 如果 cookies 有效则自动登录，否则需手动登录</li>
+                </>
+              ) : (
+                <li>1. 启动浏览器后，在浏览器中手动完成登录</li>
+              )}
+              <li>{selectedComId ? '3' : '2'}. 手动进入"推荐牛人"页面、选择职位、设置筛选条件</li>
+              <li>{selectedComId ? '4' : '3'}. 程序检测到就绪后，配置打招呼数量并启动</li>
             </ul>
           </div>
         </div>

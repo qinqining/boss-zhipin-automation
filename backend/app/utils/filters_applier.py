@@ -234,7 +234,7 @@ class FiltersApplier:
                     results["failed_filters"].append("专业")
 
             # 3. 活跃度
-            if filters.activity:
+            if filters.activity and filters.activity != '不限':
                 if await self.apply_single_select_filter("activity", filters.activity, "活跃度"):
                     results["applied_filters"].append("活跃度")
                 else:
@@ -277,7 +277,7 @@ class FiltersApplier:
                     results["failed_filters"].append("院校")
 
             # 8. 跳槽频率
-            if filters.job_hopping_frequency:
+            if filters.job_hopping_frequency and filters.job_hopping_frequency != '不限':
                 if await self.apply_single_select_filter(
                     "jobHopping",
                     filters.job_hopping_frequency,
@@ -309,7 +309,7 @@ class FiltersApplier:
                     results["failed_filters"].append("学历要求")
 
             # 12. 薪资待遇
-            if filters.salary:
+            if filters.salary and filters.salary != '不限':
                 if await self.apply_single_select_filter("salary", filters.salary, "薪资待遇"):
                     results["applied_filters"].append("薪资待遇")
                 else:

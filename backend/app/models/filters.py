@@ -3,7 +3,13 @@
 """
 
 from typing import Optional, List
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def _to_camel(string: str) -> str:
+    """将 snake_case 转换为 camelCase"""
+    components = string.split('_')
+    return components[0] + ''.join(x.title() for x in components[1:])
 
 
 class AgeFilter(BaseModel):
@@ -24,6 +30,11 @@ class AgeFilter(BaseModel):
 
 class FilterOptions(BaseModel):
     """完整的筛选条件"""
+
+    model_config = ConfigDict(
+        alias_generator=_to_camel,
+        populate_by_name=True,
+    )
 
     # 年龄范围
     age: Optional[AgeFilter] = Field(None, description="年龄范围")

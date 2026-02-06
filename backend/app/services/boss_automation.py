@@ -32,12 +32,13 @@ class BossAutomation:
         # 如果指定了com_id，使用对应的auth文件；否则不加载任何认证文件（空cookies）
         self.auth_file = self.get_auth_file_path(com_id) if com_id else None
 
-    async def initialize(self, headless: bool = False) -> bool:
+    async def initialize(self, headless: bool = False, skip_auto_navigate: bool = False) -> bool:
         """
         初始化浏览器
 
         Args:
             headless: 是否无头模式
+            skip_auto_navigate: 是否跳过自动导航（手动模式下只打开首页）
 
         Returns:
             是否初始化成功
@@ -100,8 +101,17 @@ class BossAutomation:
 
             logger.info("✅ 浏览器初始化成功")
 
-            # 准备登录页面
-            await self.prepare_login_page()
+            if skip_auto_navigate:
+                # 手动模式：只访问首页，不自动执行登录/导航逻辑
+                logger.info("📌 手动模式：只访问首页，跳过自动导航")
+                try:
+                    await self.page.goto(self.base_url, wait_until='domcontentloaded', timeout=20000)
+                    logger.info("✅ 已打开 Boss 直聘首页")
+                except Exception as e:
+                    logger.warning(f"⚠️ 访问首页失败: {str(e)}")
+            else:
+                # 自动模式：准备登录页面（原有逻辑）
+                await self.prepare_login_page()
 
             return True
 

@@ -471,23 +471,142 @@ async def get_automation_status():
     }
 
 
+@router.get("/check-ready-state")
+async def check_ready_state():
+    """检查浏览器中用户操作的就绪状态（用于手动模式轮询）
+
+    检测项目：
+    - 浏览器页面是否存在
+    - 是否已登录
+    - 是否在推荐牛人页面
+    - recommendFrame iframe 是否存在
+
+    Returns:
+        就绪状态信息
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    global _automation_service
+
+    if _automation_service is None or _automation_service.page is None:
+        return {
+            "ready": False,
+            "logged_in": False,
+            "on_recommend_page": False,
+            "has_frame": False,
+            "user_info": None,
+            "message": "浏览器未初始化"
+        }
+
+    page = _automation_service.page
+    logged_in = False
+    on_recommend_page = False
+    has_frame = False
+    user_info = None
+
+    try:
+        current_url = page.url
+
+        # 检测是否在推荐牛人页面
+        on_recommend_page = 'web/geek/recommend' in current_url or 'chat/recommend' in current_url
+
+        # 检测 recommendFrame iframe
+        for frame in page.frames:
+            if frame.name == 'recommendFrame':
+                has_frame = True
+                break
+
+        # 检测登录状态（通过 API）
+        try:
+            api_url = "https://www.zhipin.com/wapi/zpboss/h5/user/info"
+            response = await page.evaluate(f'''
+                async () => {{
+                    try {{
+                        const response = await fetch("{api_url}");
+                        return await response.json();
+                    }} catch(e) {{
+                        return {{ code: -1 }};
+                    }}
+                }}
+            ''')
+
+            if response.get('code') == 0:
+                logged_in = True
+                _automation_service.is_logged_in = True
+                zp_data = response.get('zpData', {})
+                base_info = zp_data.get('baseInfo', {})
+                user_info = {
+                    'comId': base_info.get('comId'),
+                    'name': base_info.get('name'),
+                    'showName': base_info.get('showName'),
+                    'avatar': base_info.get('avatar'),
+                    'title': base_info.get('title'),
+                }
+
+                # 如果是新登录，保存认证状态
+                com_id = base_info.get('comId')
+                if com_id and not _automation_service.auth_file:
+                    _automation_service.current_com_id = com_id
+                    _automation_service.auth_file = _automation_service.get_auth_file_path(com_id)
+
+                if _automation_service.auth_file:
+                    try:
+                        await _automation_service.context.storage_state(path=_automation_service.auth_file)
+                    except Exception:
+                        pass
+
+                # 保存账号信息到数据库
+                try:
+                    await _automation_service._save_account_info(response)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"⚠️ 检查登录状态失败: {str(e)}")
+
+        ready = logged_in and on_recommend_page and has_frame
+
+        return {
+            "ready": ready,
+            "logged_in": logged_in,
+            "on_recommend_page": on_recommend_page,
+            "has_frame": has_frame,
+            "user_info": user_info,
+            "current_url": current_url,
+            "message": "就绪" if ready else "等待用户操作"
+        }
+
+    except Exception as e:
+        logger.error(f"❌ 检查就绪状态失败: {str(e)}")
+        return {
+            "ready": False,
+            "logged_in": False,
+            "on_recommend_page": False,
+            "has_frame": False,
+            "user_info": None,
+            "message": f"检查失败: {str(e)}"
+        }
+
+
 @router.post("/init")
 async def initialize_browser(
     headless: bool = True,
-    com_id: Optional[int] = None
+    com_id: Optional[int] = None,
+    manual_mode: bool = False
 ):
     """初始化浏览器
 
     Args:
         headless: 是否无头模式（隐藏浏览器窗口）
         com_id: 可选的账号com_id，用于加载该账号的登录状态
+        manual_mode: 手动模式，只启动浏览器访问首页，不自动执行登录/导航
 
     Returns:
         初始化结果
     """
     import logging
     logger = logging.getLogger(__name__)
-    logger.info(f"🔧 初始化浏览器 - headless={headless} (类型: {type(headless).__name__}), com_id={com_id}")
+    logger.info(f"🔧 初始化浏览器 - headless={headless} (类型: {type(headless).__name__}), com_id={com_id}, manual_mode={manual_mode}")
 
     global _automation_service, _headless
 
@@ -502,14 +621,15 @@ async def initialize_browser(
 
     # 创建自动化服务实例，如果指定了com_id则使用该账号
     _automation_service = BossAutomation(com_id=com_id)
-    await _automation_service.initialize(headless=headless)
+    await _automation_service.initialize(headless=headless, skip_auto_navigate=manual_mode)
 
     return {
         "success": True,
-        "message": f"浏览器初始化成功{f'（使用账号 {com_id}）' if com_id else ''}",
+        "message": f"浏览器初始化成功{f'（使用账号 {com_id}）' if com_id else ''}{' [手动模式]' if manual_mode else ''}",
         "headless": headless,
         "service_initialized": True,
-        "com_id": com_id
+        "com_id": com_id,
+        "manual_mode": manual_mode
     }
 
 

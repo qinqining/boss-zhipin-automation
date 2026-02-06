@@ -174,13 +174,15 @@ export function useAutomation() {
 
   const initBrowser = useCallback(async (
     headless: boolean = true,
-    com_id?: number
+    com_id?: number,
+    manual_mode: boolean = false
   ): Promise<{
     success: boolean;
     message: string;
     headless: boolean;
     service_initialized: boolean;
     com_id?: number;
+    manual_mode?: boolean;
   }> => {
     setLoading(true);
     setError(null);
@@ -188,6 +190,9 @@ export function useAutomation() {
       const params = new URLSearchParams({ headless: headless.toString() });
       if (com_id) {
         params.append('com_id', com_id.toString());
+      }
+      if (manual_mode) {
+        params.append('manual_mode', 'true');
       }
       return await post(`/automation/init?${params.toString()}`);
     } catch (err) {
@@ -323,6 +328,24 @@ export function useAutomation() {
     }
   }, []);
 
+  const checkReadyState = useCallback(async (): Promise<{
+    ready: boolean;
+    logged_in: boolean;
+    on_recommend_page: boolean;
+    has_frame: boolean;
+    user_info: any;
+    current_url?: string;
+    message: string;
+  }> => {
+    try {
+      return await get('/automation/check-ready-state');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to check ready state';
+      setError(message);
+      throw err;
+    }
+  }, []);
+
   const applyFilters = useCallback(async (filters: FilterOptions): Promise<{
     success: boolean;
     message: string;
@@ -365,5 +388,6 @@ export function useAutomation() {
     getAvailableJobs,
     selectJob,
     applyFilters,
+    checkReadyState,
   };
 }

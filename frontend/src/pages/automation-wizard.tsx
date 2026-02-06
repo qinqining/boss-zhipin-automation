@@ -1,19 +1,16 @@
 /**
- * 自动化向导页面 - 一站式配置和启动自动化任务
+ * 自动化向导页面 - 简化版（3步流程）
+ * 步骤1: 启动浏览器
+ * 步骤2: 手动操作引导（登录、选职位、配筛选）
+ * 步骤3: 配置并启动打招呼
  */
-import { useState, useEffect, useRef } from 'react';
-// import { useNavigate } from 'react-router-dom';
-import { Zap, Monitor, CheckCircle2, Settings2, PlayCircle, Loader2, Briefcase, X, Save, ArrowLeft } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { Zap, Monitor, CheckCircle2, PlayCircle, Loader2, X, Save, Hand } from 'lucide-react';
 import { toast } from 'sonner';
 
 import { useAutomation } from '@/hooks/useAutomation';
-import { useJobs } from '@/hooks/useJobs';
 import { useAutomationTemplates } from '@/hooks/useAutomationTemplates';
-import { useAccounts } from '@/hooks/useAccounts';
-import type { Job, GreetingStatus, GreetingLogEntry } from '@/types';
-import type { UserAccount } from '@/types/account';
-import { FilterConfig } from '@/components/FilterConfig';
-import { type FilterOptions, DEFAULT_FILTERS } from '@/types/filters';
+import type { GreetingStatus, GreetingLogEntry } from '@/types';
 
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -21,14 +18,6 @@ import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Separator } from '@/components/ui/separator';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
 import {
   Dialog,
   DialogContent,
@@ -39,13 +28,11 @@ import {
 } from '@/components/ui/dialog';
 import { Textarea } from '@/components/ui/textarea';
 
-type WizardStep = 'browser' | 'login' | 'job-select' | 'configure' | 'confirm';
+type WizardStep = 'browser' | 'manual' | 'confirm';
 
 export default function AutomationWizard() {
-  const { initBrowser, getQRCode, checkLogin, getAvailableJobs, selectJob, applyFilters, refreshQrcode } = useAutomation();
-  const { getJobs } = useJobs();
+  const { initBrowser, checkReadyState } = useAutomation();
   const { createTemplate } = useAutomationTemplates();
-  const { getAccounts, getCurrentAccount } = useAccounts();
 
   // 步骤状态
   const [currentStep, setCurrentStep] = useState<WizardStep>('browser');
@@ -57,37 +44,20 @@ export default function AutomationWizard() {
   const [savingTemplate, setSavingTemplate] = useState(false);
 
   // 浏览器配置
-  const [showBrowser, setShowBrowser] = useState(false);
+  const [showBrowser, setShowBrowser] = useState(true); // 默认勾选，因为需要手动操作
   const [browserInitializing, setBrowserInitializing] = useState(false);
 
-  // 账号相关状态
-  const [availableAccounts, setAvailableAccounts] = useState<UserAccount[]>([]);
-  const [selectedAccountId, setSelectedAccountId] = useState<number | null>(null);
-  const [useExistingAccount, setUseExistingAccount] = useState(false);
-
-  // 登录状态
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  // 手动操作引导 - 就绪状态
+  const [readyState, setReadyState] = useState({
+    logged_in: false,
+    on_recommend_page: false,
+    has_frame: false,
+  });
   const [userInfo, setUserInfo] = useState<any>(null);
-  const [qrCode, setQrCode] = useState<string>('');
-  const [checkingLogin, setCheckingLogin] = useState(false);
-  const [qrRefreshCount, setQrRefreshCount] = useState(0); // 二维码刷新次数
-  const [qrElapsedTime, setQrElapsedTime] = useState(0); // 二维码已等待时间（秒）
-  const [qrCodeExpired, setQrCodeExpired] = useState(false); // 二维码是否过期
-
-  // 职位选择状态
-  const [availableJobs, setAvailableJobs] = useState<Array<{ value: string; label: string }>>([]);
-  const [selectedJobValue, setSelectedJobValue] = useState<string>('');
-  const [loadingJobs, setLoadingJobs] = useState(false);
-  const [selectingJob, setSelectingJob] = useState(false);
+  const readyPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // 配置状态
-  const [selectedJob, setSelectedJob] = useState<string>('');
   const [maxContacts, setMaxContacts] = useState<number | ''>(10);
-  const [filters, setFilters] = useState<FilterOptions>(DEFAULT_FILTERS);
-
-  // 数据加载
-  const [jobs, setJobs] = useState<Job[]>([]);
-  const [, setLoading] = useState(false);
 
   // 打招呼任务状态
   const [greetingStarted, setGreetingStarted] = useState(false);
@@ -99,85 +69,19 @@ export default function AutomationWizard() {
   const [expectedPositions, setExpectedPositions] = useState<string[]>([]);
   const [positionInput, setPositionInput] = useState('');
 
-  // 筛选应用
-  const [applyingFilters, setApplyingFilters] = useState(false);
-
   /**
-   * 初始化浏览器
+   * 初始化浏览器（手动模式）
    */
   const handleInitBrowser = async () => {
     setBrowserInitializing(true);
-    let loadedAccounts: typeof availableAccounts = [];
-    let currentSelectedAccountId: number | null = null;
-
     try {
-      // 先加载账号列表
-      try {
-        const accounts = await getAccounts();
-        loadedAccounts = accounts;
-        setAvailableAccounts(accounts);
-
-        // 尝试获取当前账号
-        const currentAccount = await getCurrentAccount();
-        if (currentAccount) {
-          currentSelectedAccountId = currentAccount.id;
-          setSelectedAccountId(currentAccount.id);
-        }
-      } catch (error) {
-        console.error('加载账号列表失败:', error);
-        // 继续执行，即使加载账号列表失败
-      }
-
-      const result = await initBrowser(!showBrowser);
+      const result = await initBrowser(!showBrowser, undefined, true);
 
       if (result.success) {
-        toast.success(result.message);
-
-        // 进入登录步骤，让用户选择账号或扫码登录
-        setCurrentStep('login');
-
-        // 如果没有已保存的账号，自动获取二维码
-        if (loadedAccounts.length === 0) {
-          // 没有账号，自动获取二维码
-          setCheckingLogin(true);
-          try {
-            const qrResult = await getQRCode();
-            if (qrResult.qrcode) {
-              setQrCode(qrResult.qrcode);
-              // 开始轮询登录状态
-              startLoginPolling();
-            } else {
-              toast.error('获取二维码失败');
-            }
-          } catch (error) {
-            console.error('获取二维码失败:', error);
-            toast.error('获取二维码失败');
-          } finally {
-            setCheckingLogin(false);
-          }
-        } else if (currentSelectedAccountId) {
-          // 如果已经有选中的账号，尝试使用该账号登录
-          setCheckingLogin(true);
-          toast.info('正在检查登录状态...');
-
-          try {
-            const loginResult = await checkLogin();
-
-            if (loginResult.logged_in) {
-              // 已登录,进入职位选择步骤
-              setIsLoggedIn(true);
-              setUserInfo(loginResult.user_info);
-              setCurrentStep('job-select');
-              toast.success(`欢迎回来,${loginResult.user_info?.showName || '用户'}!`);
-              // 加载可用职位
-              await loadAvailableJobs();
-            }
-          } catch (error) {
-            console.error('检查登录状态失败:', error);
-          } finally {
-            setCheckingLogin(false);
-          }
-        }
+        toast.success('浏览器已启动，请在浏览器中完成操作');
+        setCurrentStep('manual');
+        // 开始轮询就绪状态
+        startReadyStatePolling();
       }
     } catch (error) {
       console.error('浏览器初始化失败:', error);
@@ -188,302 +92,39 @@ export default function AutomationWizard() {
   };
 
   /**
-   * 选择账号并使用其登录状态
+   * 开始轮询就绪状态
    */
-  const handleSelectExistingAccount = async () => {
-    if (!selectedAccountId) {
-      toast.error('请选择账号');
-      return;
+  const startReadyStatePolling = useCallback(() => {
+    if (readyPollingRef.current) {
+      clearInterval(readyPollingRef.current);
     }
 
-    setCheckingLogin(true);
-    setUseExistingAccount(true);
-
-    try {
-      // 找到选中账号的com_id
-      const selectedAccount = availableAccounts.find(acc => acc.id === selectedAccountId);
-      if (!selectedAccount) {
-        toast.error('未找到选中的账号');
-        return;
-      }
-
-      // 使用选中账号的com_id初始化浏览器（加载该账号的cookies）
-      const result = await initBrowser(!showBrowser, selectedAccount.com_id);
-
-      if (result.success) {
-        toast.success(result.message);
-
-        // 检查登录状态
-        const loginResult = await checkLogin();
-
-        if (loginResult.logged_in) {
-          setIsLoggedIn(true);
-          setUserInfo(loginResult.user_info);
-          setCurrentStep('job-select');
-          toast.success(`使用账号 ${loginResult.user_info?.showName || '用户'} 登录成功！`);
-          // 加载可用职位
-          await loadAvailableJobs();
-        } else {
-          toast.error('该账号登录状态已过期，请重新扫码登录');
-          setUseExistingAccount(false);
-          await handleGetQRCode();
-        }
-      }
-    } catch (error) {
-      console.error('使用已有账号失败:', error);
-      toast.error('使用已有账号失败');
-      setUseExistingAccount(false);
-    } finally {
-      setCheckingLogin(false);
-    }
-  };
-
-  /**
-   * 获取二维码
-   */
-  const handleGetQRCode = async () => {
-    setCheckingLogin(true);
-    setUseExistingAccount(false);
-    setSelectedAccountId(null);
-
-    try {
-      const qrResult = await getQRCode();
-      if (qrResult.qrcode) {
-        setQrCode(qrResult.qrcode);
-        // 开始轮询登录状态
-        startLoginPolling();
-      } else if (qrResult.message === '已登录，无需扫码') {
-        // 已经登录，获取用户信息
-        const loginResult = await checkLogin();
-        if (loginResult.logged_in) {
-          setIsLoggedIn(true);
-          setUserInfo(loginResult.user_info);
-          setCurrentStep('job-select');
-          toast.success('检测到已登录状态');
-          // 加载可用职位
-          await loadAvailableJobs();
-        }
-      }
-    } catch (error) {
-      console.error('获取二维码失败:', error);
-      toast.error('获取二维码失败');
-    } finally {
-      setCheckingLogin(false);
-    }
-  };
-
-  /**
-   * 重新登录 - 重置状态并重新获取二维码
-   */
-  const handleRetryLogin = async () => {
-    console.log('🔄 重新登录...');
-    setQrCodeExpired(false);
-    setQrRefreshCount(0);
-    setQrElapsedTime(0);
-    await handleGetQRCode();
-  };
-
-  /**
-   * 返回账号选择界面
-   */
-  const handleBackToAccountSelect = () => {
-    // 清空二维码状态
-    setQrCode('');
-    setQrCodeExpired(false);
-    setQrRefreshCount(0);
-    setQrElapsedTime(0);
-    setCheckingLogin(false);
-    setUseExistingAccount(false);
-
-    toast.info('已返回账号选择');
-  };
-
-  /**
-   * 轮询登录状态
-   */
-  const startLoginPolling = () => {
-    let localRefreshCount = 0; // 二维码刷新次数计数器
-    const MAX_QR_REFRESH_COUNT = 5; // 最大刷新次数
-    const startTime = Date.now(); // 记录开始时间
-
-    // 重置UI状态
-    setQrRefreshCount(0);
-    setQrElapsedTime(0);
-    setQrCodeExpired(false);
-
-    // 计时器 - 每秒更新一次显示的时间
-    const timerInterval = setInterval(() => {
-      const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      setQrElapsedTime(elapsed);
-    }, 1000);
-
-    // 登录状态轮询 - 每2秒检查一次
-    const loginInterval = setInterval(async () => {
+    readyPollingRef.current = setInterval(async () => {
       try {
-        const result = await checkLogin();
-        if (result.logged_in) {
-          clearInterval(loginInterval);
-          clearInterval(qrCheckInterval);
-          clearInterval(timerInterval);
-          setIsLoggedIn(true);
-          setUserInfo(result.user_info);
-          setCurrentStep('job-select');
-          toast.success('登录成功！');
-          // 加载可用职位
-          await loadAvailableJobs();
+        const state = await checkReadyState();
+        setReadyState({
+          logged_in: state.logged_in,
+          on_recommend_page: state.on_recommend_page,
+          has_frame: state.has_frame,
+        });
+
+        if (state.user_info) {
+          setUserInfo(state.user_info);
         }
-      } catch (error) {
-        // 继续轮询
-      }
-    }, 2000);
 
-    // 二维码状态检测 - 每1秒检查一次是否需要刷新
-    const qrCheckInterval = setInterval(async () => {
-      // 先检查是否已经达到最大刷新次数
-      if (localRefreshCount >= MAX_QR_REFRESH_COUNT) {
-        console.error('❌ 二维码刷新超时：已达到最大刷新次数 (5次)');
-        clearInterval(loginInterval);
-        clearInterval(qrCheckInterval);
-        clearInterval(timerInterval);
-        setQrCodeExpired(true); // 标记二维码已过期
-        toast.error('二维码刷新超时，请点击重新登录按钮');
-        return;
-      }
-
-      try {
-        // 调用后端检查二维码状态
-        const refreshResult = await refreshQrcode();
-
-        if (refreshResult.need_refresh) {
-          // 检测到二维码需要刷新
-          localRefreshCount++;
-          setQrRefreshCount(localRefreshCount);
-          console.log(`🔄 检测到二维码过期，自动刷新... (第 ${localRefreshCount}/${MAX_QR_REFRESH_COUNT} 次)`);
-
-          if (refreshResult.qrcode) {
-            // 更新二维码显示
-            setQrCode(refreshResult.qrcode);
-            console.log(`✅ 二维码已刷新 (第 ${localRefreshCount} 次)`);
-            toast.info(`二维码已自动刷新 (${localRefreshCount}/${MAX_QR_REFRESH_COUNT})`);
-          } else {
-            console.warn(`⚠️ 刷新后未获取到新二维码: ${refreshResult.message}`);
+        // 全部就绪后停止轮询
+        if (state.ready) {
+          if (readyPollingRef.current) {
+            clearInterval(readyPollingRef.current);
+            readyPollingRef.current = null;
           }
+          toast.success('所有条件已满足，可以继续！');
         }
       } catch (error) {
-        console.error('❌ 检查二维码状态失败:', error);
-        // 继续轮询，不中断
+        // 静默忽略轮询错误
       }
-    }, 1000); // 每1秒检查一次
-
-    // 3分钟后停止轮询（作为备用超时机制）
-    setTimeout(() => {
-      clearInterval(loginInterval);
-      clearInterval(qrCheckInterval);
-      clearInterval(timerInterval);
-      if (localRefreshCount >= MAX_QR_REFRESH_COUNT) {
-        console.log('⏱️ 轮询已达到最大次数限制');
-      } else {
-        console.log('⏱️ 轮询已达到时间限制 (3分钟)');
-      }
-    }, 180000);
-  };
-
-  /**
-   * 加载可用职位列表
-   */
-  const loadAvailableJobs = async () => {
-    setLoadingJobs(true);
-    try {
-      const result = await getAvailableJobs();
-      if (result.success) {
-        setAvailableJobs(result.jobs);
-        if (result.jobs.length > 0) {
-          setSelectedJobValue(result.jobs[0].value);
-        }
-        toast.success(`成功加载 ${result.jobs.length} 个职位`);
-      } else {
-        toast.error(result.message || '获取职位列表失败');
-      }
-    } catch (error) {
-      console.error('加载职位列表失败:', error);
-      toast.error('加载职位列表失败');
-    } finally {
-      setLoadingJobs(false);
-    }
-  };
-
-  /**
-   * 选择职位并进入配置步骤
-   */
-  const handleSelectJob = async () => {
-    if (!selectedJobValue) {
-      toast.error('请选择职位');
-      return;
-    }
-
-    setSelectingJob(true);
-    try {
-      const result = await selectJob(selectedJobValue);
-      if (result.success) {
-        toast.success('职位选择成功');
-        setSelectedJob(selectedJobValue); // 设置选中的职位ID
-        setCurrentStep('configure');
-        // 加载职位数据
-        await loadData();
-      } else {
-        toast.error(result.message || '职位选择失败');
-      }
-    } catch (error) {
-      console.error('选择职位失败:', error);
-      toast.error('选择职位失败');
-    } finally {
-      setSelectingJob(false);
-    }
-  };
-
-  /**
-   * 加载职位数据
-   */
-  const loadData = async () => {
-    setLoading(true);
-    try {
-      const jobsResult = await getJobs();
-
-      if (jobsResult.success) {
-        setJobs(jobsResult.jobs);
-      }
-    } catch (error) {
-      console.error('加载数据失败:', error);
-      toast.error('加载数据失败');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-
-  /**
-   * 应用筛选条件到浏览器
-   */
-  const handleApplyFilters = async () => {
-    setApplyingFilters(true);
-    try {
-      toast.info('正在浏览器中应用筛选条件...');
-      const filterResult = await applyFilters(filters);
-
-      if (filterResult.success) {
-        toast.success(`已应用 ${filterResult.applied_count} 项筛选条件`);
-        // 筛选成功后进入确认步骤
-        setCurrentStep('confirm');
-      } else {
-        toast.error('筛选条件应用失败，请重试');
-      }
-    } catch (filterError) {
-      console.error('应用筛选条件失败:', filterError);
-      toast.error('应用筛选条件失败');
-    } finally {
-      setApplyingFilters(false);
-    }
-  };
+    }, 3000);
+  }, [checkReadyState]);
 
   /**
    * 添加期望职位
@@ -510,7 +151,6 @@ export default function AutomationWizard() {
    */
   const handleStartAutomation = async () => {
     try {
-      // 验证输入
       const targetCount = maxContacts === '' ? 10 : maxContacts;
       if (targetCount < 1 || targetCount > 500) {
         toast.error('打招呼数量必须在 1-500 之间');
@@ -519,7 +159,6 @@ export default function AutomationWizard() {
 
       toast.info('正在启动打招呼任务...');
 
-      // 直接调用 greeting API
       const response = await fetch('/api/greeting/start', {
         method: 'POST',
         headers: {
@@ -536,16 +175,12 @@ export default function AutomationWizard() {
       if (response.ok) {
         toast.success('打招呼任务已启动！');
         setGreetingStarted(true);
-
-        // 开始轮询状态
         startPolling();
       } else {
-        // 处理各种错误格式
         let errorMessage = '启动失败';
         if (typeof data.detail === 'string') {
           errorMessage = data.detail;
         } else if (Array.isArray(data.detail)) {
-          // FastAPI验证错误格式
           errorMessage = data.detail.map((err: any) => err.msg).join(', ');
         } else if (data.message) {
           errorMessage = data.message;
@@ -572,11 +207,8 @@ export default function AutomationWizard() {
       await createTemplate({
         name: templateName.trim(),
         description: templateDescription.trim() || undefined,
-        account_id: userInfo?.com_id,
+        account_id: userInfo?.comId,
         headless: !showBrowser,
-        job_id: selectedJobValue,
-        job_name: availableJobs.find(j => j.value === selectedJobValue)?.label,
-        filters: filters,
         greeting_count: maxContacts === '' ? 10 : maxContacts,
         expected_positions: expectedPositions.length > 0 ? expectedPositions : undefined,
       });
@@ -603,23 +235,19 @@ export default function AutomationWizard() {
 
     pollingIntervalRef.current = setInterval(async () => {
       try {
-        // 获取状态
         const statusRes = await fetch('/api/greeting/status');
         const statusData = await statusRes.json();
         setGreetingStatus(statusData);
 
-        // 获取日志
         const logsRes = await fetch('/api/greeting/logs?last_n=100');
         const logsData = await logsRes.json();
         setGreetingLogs(logsData.logs);
 
-        // 如果任务完成或出错，停止轮询并重置按钮状态
         if (statusData.status !== 'running') {
           if (pollingIntervalRef.current) {
             clearInterval(pollingIntervalRef.current);
             pollingIntervalRef.current = null;
           }
-          // 重置按钮状态，使其可以再次点击
           setGreetingStarted(false);
         }
       } catch (error) {
@@ -634,6 +262,9 @@ export default function AutomationWizard() {
       if (pollingIntervalRef.current) {
         clearInterval(pollingIntervalRef.current);
       }
+      if (readyPollingRef.current) {
+        clearInterval(readyPollingRef.current);
+      }
     };
   }, []);
 
@@ -644,24 +275,15 @@ export default function AutomationWizard() {
       try {
         const template = JSON.parse(templateData);
 
-        // 应用模板配置
         setShowBrowser(!template.headless);
-        if (template.filters) {
-          setFilters(template.filters);
-        }
         if (template.greeting_count) {
           setMaxContacts(template.greeting_count);
         }
         if (template.expected_positions && template.expected_positions.length > 0) {
           setExpectedPositions(template.expected_positions);
         }
-        if (template.job_id) {
-          setSelectedJobValue(template.job_id);
-        }
 
-        // 清除sessionStorage
         sessionStorage.removeItem('selectedTemplate');
-
         toast.success(`已加载模板：${template.name}`);
       } catch (error) {
         console.error('加载模板失败:', error);
@@ -671,17 +293,17 @@ export default function AutomationWizard() {
   }, []);
 
   /**
-   * 渲染浏览器配置步骤
+   * 渲染步骤1: 启动浏览器
    */
   const renderBrowserStep = () => (
     <Card className="max-w-2xl mx-auto">
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <Monitor className="h-6 w-6 text-primary" />
-          步骤 1: 浏览器配置
+          步骤 1: 启动浏览器
         </CardTitle>
         <CardDescription>
-          选择浏览器显示模式，然后开始初始化
+          启动 Playwright 浏览器，用于后续手动操作
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
@@ -700,20 +322,23 @@ export default function AutomationWizard() {
                 显示浏览器窗口
               </Label>
               <p className="text-sm text-muted-foreground mt-1.5">
-                勾选此选项将显示浏览器窗口，便于调试和观察执行过程。
-                建议首次使用时勾选，熟悉后可取消以提高效率。
+                需要在浏览器中手动操作，建议保持勾选。
               </p>
             </div>
           </div>
 
           <div className="bg-blue-50 dark:bg-blue-950 p-4 rounded-lg">
             <h4 className="font-medium text-blue-900 dark:text-blue-100 mb-2">
-              💡 提示
+              新流程说明
             </h4>
             <ul className="text-sm text-blue-800 dark:text-blue-200 space-y-1">
-              <li>• 显示窗口：可以看到浏览器操作过程，适合调试</li>
-              <li>• 隐藏窗口：后台静默运行，节省资源，适合正式使用</li>
-              <li>• 初始化后无法更改，如需修改请重新开始</li>
+              <li>1. 启动浏览器后，在浏览器中手动完成登录</li>
+              <li>2. 手动进入"推荐牛人"页面、选择职位、设置筛选条件</li>
+              <li>3. 程序检测到就绪后，配置打招呼数量并启动</li>
+              <li>
+                <span className="font-medium">优势：</span>
+                手动操作更可靠，不受网站更新影响
+              </li>
             </ul>
           </div>
         </div>
@@ -727,12 +352,12 @@ export default function AutomationWizard() {
           {browserInitializing ? (
             <>
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              正在初始化浏览器...
+              正在启动浏览器...
             </>
           ) : (
             <>
               <Zap className="mr-2 h-4 w-4" />
-              开始初始化
+              启动浏览器
             </>
           )}
         </Button>
@@ -741,369 +366,210 @@ export default function AutomationWizard() {
   );
 
   /**
-   * 渲染登录步骤
+   * 渲染步骤2: 手动操作引导
    */
-  const renderLoginStep = () => (
-    <Card className="max-w-2xl mx-auto">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Zap className="h-6 w-6 text-primary" />
-          步骤 2: 登录账号
-        </CardTitle>
-        <CardDescription>
-          {availableAccounts.length > 0
-            ? '选择已有账号或扫码登录新账号'
-            : '使用 Boss 直聘 APP 扫描二维码登录'}
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-6">
-        {/* 账号选择区域 */}
-        {availableAccounts.length > 0 && !qrCode && (
-          <div className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="account-select">选择已登录的账号</Label>
-              <Select
-                value={selectedAccountId?.toString() || ''}
-                onValueChange={(value) => setSelectedAccountId(Number(value))}
-              >
-                <SelectTrigger id="account-select">
-                  <SelectValue placeholder="请选择账号" />
-                </SelectTrigger>
-                <SelectContent>
-                  {availableAccounts.map((account) => (
-                    <SelectItem key={account.id} value={account.id.toString()}>
-                      <div className="flex items-center gap-2">
-                        {account.avatar && (
-                          <img
-                            src={account.avatar}
-                            alt={account.show_name}
-                            className="w-6 h-6 rounded-full"
-                          />
-                        )}
-                        <span>{account.show_name}</span>
-                        <span className="text-muted-foreground text-sm">
-                          ({account.company_short_name || account.company_name})
-                        </span>
-                      </div>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
+  const renderManualStep = () => {
+    const allReady = readyState.logged_in && readyState.on_recommend_page && readyState.has_frame;
 
-            <Button
-              onClick={handleSelectExistingAccount}
-              disabled={!selectedAccountId || checkingLogin}
-              className="w-full"
-            >
-              {checkingLogin ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  正在加载账号...
-                </>
-              ) : (
-                '使用选中账号'
-              )}
-            </Button>
-
-            <Separator />
-
-            <div className="text-center">
-              <Button
-                variant="outline"
-                onClick={handleGetQRCode}
-                disabled={checkingLogin}
-                className="w-full"
-              >
-                或者扫码登录新账号
-              </Button>
-            </div>
-          </div>
-        )}
-
-        {/* 二维码登录区域 */}
-        {checkingLogin && !qrCode && !useExistingAccount ? (
-          <div className="flex flex-col items-center justify-center py-12">
-            <Loader2 className="h-12 w-12 animate-spin text-muted-foreground mb-4" />
-            <p className="text-muted-foreground">正在获取二维码...</p>
-          </div>
-        ) : qrCode ? (
-          <div className="flex flex-col items-center space-y-4">
-            {/* 二维码容器 - 支持遮罩 */}
-            <div className="relative">
-              <img
-                src={qrCode}
-                alt="登录二维码"
-                className="w-64 h-64 border-2 border-gray-200 rounded-lg"
-              />
-              {/* 二维码过期遮罩 */}
-              {qrCodeExpired && (
-                <div className="absolute inset-0 bg-black/60 backdrop-blur-sm rounded-lg flex flex-col items-center justify-center gap-4">
-                  <div className="text-white text-center">
-                    <p className="text-lg font-semibold mb-2">二维码已过期</p>
-                    <p className="text-sm text-gray-300">已达到最大刷新次数 (5次)</p>
-                  </div>
-                  <Button
-                    onClick={handleRetryLogin}
-                    variant="default"
-                    className="bg-white text-black hover:bg-gray-100"
-                  >
-                    重新登录
-                  </Button>
-                </div>
-              )}
-            </div>
-            <p className="text-sm text-muted-foreground text-center">
-              请使用 Boss 直聘 APP 扫描二维码登录
-            </p>
-            {!qrCodeExpired && (
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                等待扫码...
-              </div>
-            )}
-            {/* 显示刷新次数和计时 */}
-            <div className="flex flex-col items-center gap-2 pt-2 border-t border-gray-200 w-full">
-              <div className="flex items-center gap-4 text-xs text-muted-foreground">
-                <div className="flex items-center gap-1">
-                  <span className="font-medium">已刷新:</span>
-                  <span className="font-mono">{qrRefreshCount}/5 次</span>
-                </div>
-                <div className="flex items-center gap-1">
-                  <span className="font-medium">已等待:</span>
-                  <span className="font-mono">
-                    {Math.floor(qrElapsedTime / 60)}:{String(qrElapsedTime % 60).padStart(2, '0')}
-                  </span>
-                </div>
-              </div>
-              {!qrCodeExpired && (
-                <div className="text-xs text-gray-600">
-                  💡 系统正在每秒检测二维码状态，过期时将自动刷新
-                </div>
-              )}
-              {qrRefreshCount > 0 && !qrCodeExpired && (
-                <div className="text-xs text-blue-600">
-                  已自动刷新 {qrRefreshCount} 次（最多5次）
-                </div>
-              )}
-              {qrCodeExpired && (
-                <div className="text-xs text-red-600">
-                  二维码刷新超时，请点击上方按钮重新登录
-                </div>
-              )}
-            </div>
-
-            {/* 返回按钮 */}
-            {availableAccounts.length > 0 && (
-              <div className="w-full pt-4 border-t border-gray-200">
-                <Button
-                  variant="outline"
-                  onClick={handleBackToAccountSelect}
-                  className="w-full"
-                >
-                  <ArrowLeft className="mr-2 h-4 w-4" />
-                  返回选择账号
-                </Button>
-              </div>
-            )}
-          </div>
-        ) : null}
-      </CardContent>
-    </Card>
-  );
-
-  /**
-   * 渲染职位选择步骤
-   */
-  const renderJobSelectStep = () => (
-    <Card className="max-w-2xl mx-auto">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Briefcase className="h-6 w-6 text-primary" />
-          步骤 3: 选择招聘职位
-        </CardTitle>
-        <CardDescription>
-          选择要为其推荐候选人的招聘职位
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-6">
-        {loadingJobs ? (
-          <div className="flex flex-col items-center justify-center py-12">
-            <Loader2 className="h-12 w-12 animate-spin text-muted-foreground mb-4" />
-            <p className="text-muted-foreground">正在加载职位列表...</p>
-          </div>
-        ) : availableJobs.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-12">
-            <p className="text-muted-foreground mb-4">暂无可用职位</p>
-            <Button onClick={loadAvailableJobs} variant="outline">
-              重新加载
-            </Button>
-          </div>
-        ) : (
-          <>
-            <div className="space-y-4">
-              <Label htmlFor="job-select">可用职位</Label>
-              <Select
-                value={selectedJobValue}
-                onValueChange={(value) => setSelectedJobValue(value)}
-              >
-                <SelectTrigger id="job-select">
-                  <SelectValue placeholder="选择职位" />
-                </SelectTrigger>
-                <SelectContent>
-                  {availableJobs.map((job) => (
-                    <SelectItem key={job.value} value={job.value}>
-                      {job.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <p className="text-sm text-muted-foreground">
-                找到 {availableJobs.length} 个可用职位
-              </p>
-            </div>
-
-            <div className="bg-blue-50 dark:bg-blue-950 p-4 rounded-lg">
-              <h4 className="font-medium text-blue-900 dark:text-blue-100 mb-2">
-                💡 提示
-              </h4>
-              <ul className="text-sm text-blue-800 dark:text-blue-200 space-y-1">
-                <li>• 选择的职位将用于在推荐牛人页面筛选候选人</li>
-                <li>• 系统会根据选择的职位推荐相关候选人</li>
-                <li>• 确保选择正确的职位以获得最佳推荐效果</li>
-              </ul>
-            </div>
-
-            <div className="flex justify-end gap-4">
-              <Button
-                variant="outline"
-                onClick={() => setCurrentStep('login')}
-                disabled={selectingJob}
-              >
-                返回登录
-              </Button>
-              <Button
-                onClick={handleSelectJob}
-                disabled={!selectedJobValue || selectingJob}
-              >
-                {selectingJob ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    正在选择...
-                  </>
-                ) : (
-                  <>
-                    <CheckCircle2 className="mr-2 h-4 w-4" />
-                    确认选择
-                  </>
-                )}
-              </Button>
-            </div>
-          </>
-        )}
-      </CardContent>
-    </Card>
-  );
-
-  /**
-   * 渲染配置步骤
-   */
-  const renderConfigureStep = () => (
-    <div className="max-w-4xl mx-auto space-y-6">
-      <Card>
-        <CardContent className="pt-6">
-          <div className="flex items-center gap-4">
-            {userInfo?.avatar && (
-              <img
-                src={userInfo.avatar}
-                alt={userInfo.showName}
-                className="w-12 h-12 rounded-full object-cover"
-              />
-            )}
-            <div>
-              <p className="font-medium text-lg">{userInfo?.showName || '未知用户'}</p>
-              <p className="text-sm text-muted-foreground">
-                {userInfo?.brandName || '未知公司'}
-              </p>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card>
+    return (
+      <Card className="max-w-2xl mx-auto">
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Settings2 className="h-6 w-6 text-primary" />
-            步骤 4: 配置筛选条件
+            <Hand className="h-6 w-6 text-primary" />
+            步骤 2: 在浏览器中完成操作
           </CardTitle>
           <CardDescription>
-            设置候选人筛选条件以精准匹配目标人才
+            请在已打开的浏览器窗口中完成以下操作，程序会自动检测状态
           </CardDescription>
         </CardHeader>
-        <CardContent>
-          <FilterConfig filters={filters} onChange={setFilters} />
+        <CardContent className="space-y-6">
+          {/* 操作指引 */}
+          <div className="bg-amber-50 dark:bg-amber-950 p-4 rounded-lg">
+            <h4 className="font-medium text-amber-900 dark:text-amber-100 mb-3">
+              请在浏览器中完成以下操作：
+            </h4>
+            <ol className="text-sm text-amber-800 dark:text-amber-200 space-y-2 list-decimal list-inside">
+              <li>登录 Boss 直聘账号（扫码或手机号登录）</li>
+              <li>进入"推荐牛人"页面</li>
+              <li>选择招聘职位</li>
+              <li>设置筛选条件（如需要）</li>
+            </ol>
+          </div>
+
+          {/* 状态检测指示器 */}
+          <div className="space-y-3">
+            <h4 className="font-medium text-sm text-muted-foreground">实时状态检测</h4>
+
+            <div className="space-y-2">
+              {/* 登录状态 */}
+              <div className={`flex items-center gap-3 p-3 rounded-lg border ${
+                readyState.logged_in
+                  ? 'bg-green-50 border-green-200 dark:bg-green-950 dark:border-green-800'
+                  : 'bg-gray-50 border-gray-200 dark:bg-gray-900 dark:border-gray-700'
+              }`}>
+                <div className={`flex items-center justify-center w-6 h-6 rounded-full ${
+                  readyState.logged_in
+                    ? 'bg-green-500 text-white'
+                    : 'bg-gray-300 dark:bg-gray-600'
+                }`}>
+                  {readyState.logged_in ? (
+                    <CheckCircle2 className="h-4 w-4" />
+                  ) : (
+                    <span className="text-xs font-medium">1</span>
+                  )}
+                </div>
+                <div className="flex-1">
+                  <p className={`text-sm font-medium ${
+                    readyState.logged_in ? 'text-green-700 dark:text-green-300' : ''
+                  }`}>
+                    {readyState.logged_in ? '已登录' : '等待登录...'}
+                  </p>
+                  {readyState.logged_in && userInfo?.showName && (
+                    <p className="text-xs text-green-600 dark:text-green-400">
+                      {userInfo.showName}
+                    </p>
+                  )}
+                </div>
+                {readyState.logged_in && (
+                  <Badge variant="outline" className="bg-green-100 text-green-700 border-green-300">
+                    完成
+                  </Badge>
+                )}
+              </div>
+
+              {/* 推荐页面状态 */}
+              <div className={`flex items-center gap-3 p-3 rounded-lg border ${
+                readyState.on_recommend_page
+                  ? 'bg-green-50 border-green-200 dark:bg-green-950 dark:border-green-800'
+                  : 'bg-gray-50 border-gray-200 dark:bg-gray-900 dark:border-gray-700'
+              }`}>
+                <div className={`flex items-center justify-center w-6 h-6 rounded-full ${
+                  readyState.on_recommend_page
+                    ? 'bg-green-500 text-white'
+                    : 'bg-gray-300 dark:bg-gray-600'
+                }`}>
+                  {readyState.on_recommend_page ? (
+                    <CheckCircle2 className="h-4 w-4" />
+                  ) : (
+                    <span className="text-xs font-medium">2</span>
+                  )}
+                </div>
+                <div className="flex-1">
+                  <p className={`text-sm font-medium ${
+                    readyState.on_recommend_page ? 'text-green-700 dark:text-green-300' : ''
+                  }`}>
+                    {readyState.on_recommend_page ? '在推荐牛人页面' : '等待进入推荐牛人页面...'}
+                  </p>
+                </div>
+                {readyState.on_recommend_page && (
+                  <Badge variant="outline" className="bg-green-100 text-green-700 border-green-300">
+                    完成
+                  </Badge>
+                )}
+              </div>
+
+              {/* 推荐列表状态 */}
+              <div className={`flex items-center gap-3 p-3 rounded-lg border ${
+                readyState.has_frame
+                  ? 'bg-green-50 border-green-200 dark:bg-green-950 dark:border-green-800'
+                  : 'bg-gray-50 border-gray-200 dark:bg-gray-900 dark:border-gray-700'
+              }`}>
+                <div className={`flex items-center justify-center w-6 h-6 rounded-full ${
+                  readyState.has_frame
+                    ? 'bg-green-500 text-white'
+                    : 'bg-gray-300 dark:bg-gray-600'
+                }`}>
+                  {readyState.has_frame ? (
+                    <CheckCircle2 className="h-4 w-4" />
+                  ) : (
+                    <span className="text-xs font-medium">3</span>
+                  )}
+                </div>
+                <div className="flex-1">
+                  <p className={`text-sm font-medium ${
+                    readyState.has_frame ? 'text-green-700 dark:text-green-300' : ''
+                  }`}>
+                    {readyState.has_frame ? '推荐列表已加载' : '等待推荐列表加载...'}
+                  </p>
+                </div>
+                {readyState.has_frame && (
+                  <Badge variant="outline" className="bg-green-100 text-green-700 border-green-300">
+                    完成
+                  </Badge>
+                )}
+              </div>
+            </div>
+
+            {/* 轮询状态提示 */}
+            {!allReady && (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                每 3 秒自动检测一次...
+              </div>
+            )}
+          </div>
+
+          {/* 继续按钮 */}
+          <Button
+            onClick={() => setCurrentStep('confirm')}
+            disabled={!allReady}
+            className="w-full"
+            size="lg"
+          >
+            {allReady ? (
+              <>
+                <CheckCircle2 className="mr-2 h-4 w-4" />
+                继续配置
+              </>
+            ) : (
+              '请先完成上述操作'
+            )}
+          </Button>
         </CardContent>
       </Card>
-
-      <div className="flex justify-between gap-4">
-        <Button
-          variant="outline"
-          onClick={() => setCurrentStep('job-select')}
-          disabled={applyingFilters}
-        >
-          返回职位选择
-        </Button>
-        <Button
-          onClick={handleApplyFilters}
-          disabled={!selectedJob || jobs.length === 0 || applyingFilters}
-        >
-          {applyingFilters ? (
-            <>
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              正在应用筛选条件...
-            </>
-          ) : (
-            '应用筛选并继续'
-          )}
-        </Button>
-      </div>
-    </div>
-  );
+    );
+  };
 
   /**
-   * 渲染确认步骤
+   * 渲染步骤3: 配置并启动
    */
   const renderConfirmStep = () => {
-    // 统计设置的筛选条件数量
-    const activeFiltersCount = Object.entries(filters).filter(([key, value]) => {
-      if (key === 'age') return value !== null;
-      if (Array.isArray(value)) return value.length > 0;
-      return value && value !== '不限';
-    }).length;
-
     return (
       <div className="max-w-2xl mx-auto space-y-6">
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <PlayCircle className="h-6 w-6 text-primary" />
-              步骤 5: 确认并启动
+              步骤 3: 配置并启动
             </CardTitle>
             <CardDescription>
-              请确认以下配置无误后，点击启动按钮
+              设置打招呼参数，然后启动自动打招呼
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
-            <div className="space-y-4">
-              <div>
-                <Label className="text-muted-foreground">浏览器显示</Label>
-                <p className="font-medium">
-                  {showBrowser ? '显示窗口' : '后台运行（隐藏窗口）'}
-                </p>
+            {/* 用户信息 */}
+            {userInfo && (
+              <div className="flex items-center gap-4 p-4 bg-green-50 dark:bg-green-950 rounded-lg">
+                {userInfo.avatar && (
+                  <img
+                    src={userInfo.avatar}
+                    alt={userInfo.showName}
+                    className="w-10 h-10 rounded-full object-cover"
+                  />
+                )}
+                <div>
+                  <p className="font-medium">{userInfo.showName || '已登录用户'}</p>
+                  <p className="text-sm text-muted-foreground">
+                    已就绪，职位和筛选条件已在浏览器中手动设置
+                  </p>
+                </div>
               </div>
+            )}
 
+            <div className="space-y-4">
+              {/* 打招呼数量 */}
               <div className="space-y-2">
-                <Label htmlFor="maxContacts">需要打招呼的数量</Label>
+                <Label htmlFor="maxContacts">打招呼数量</Label>
                 <p className="text-sm text-muted-foreground">
                   成功打招呼达到此数量后停止（不包括跳过的候选人）
                 </p>
@@ -1125,7 +591,6 @@ export default function AutomationWizard() {
                     }
                   }}
                   onBlur={(e) => {
-                    // 失去焦点时，如果为空则设置为默认值10
                     if (e.target.value === '') {
                       setMaxContacts(10);
                     }
@@ -1137,14 +602,13 @@ export default function AutomationWizard() {
                 </p>
               </div>
 
-              {/* 期望职位匹配（可选） */}
+              {/* 期望职位匹配 */}
               <div className="space-y-2">
                 <Label>期望职位匹配（可选）</Label>
                 <p className="text-sm text-muted-foreground">
                   只向期望职位包含以下关键词的候选人打招呼
                 </p>
 
-                {/* 输入框和添加按钮 */}
                 <div className="flex gap-2">
                   <Input
                     placeholder="输入职位关键词，如：Java、产品经理"
@@ -1167,7 +631,6 @@ export default function AutomationWizard() {
                   </Button>
                 </div>
 
-                {/* 标签列表展示 */}
                 {expectedPositions.length > 0 && (
                   <div className="flex flex-wrap gap-2 mt-2">
                     {expectedPositions.map((pos, index) => (
@@ -1186,101 +649,18 @@ export default function AutomationWizard() {
                   </div>
                 )}
               </div>
-
-              <div>
-                <Label className="text-muted-foreground">筛选条件</Label>
-                <p className="font-medium">
-                  已设置 {activeFiltersCount} 项筛选条件
-                </p>
-
-                {/* 显示部分关键筛选 */}
-                <div className="mt-2 space-y-1">
-                  {filters.age && (
-                    <p className="text-sm text-muted-foreground">
-                      • 年龄: {filters.age.min} - {filters.age.max || '不限'} 岁
-                    </p>
-                  )}
-                  {filters.activity && filters.activity !== '不限' && (
-                    <p className="text-sm text-muted-foreground">
-                      • 活跃度: {filters.activity}
-                    </p>
-                  )}
-                  {filters.jobHoppingFrequency && filters.jobHoppingFrequency !== '不限' && (
-                    <p className="text-sm text-muted-foreground">
-                      • 跳槽频率: {filters.jobHoppingFrequency}
-                    </p>
-                  )}
-                  {filters.salary && filters.salary !== '不限' && (
-                    <p className="text-sm text-muted-foreground">
-                      • 薪资待遇: {filters.salary}
-                    </p>
-                  )}
-                  {filters.gender && filters.gender.length > 0 && (
-                    <p className="text-sm text-muted-foreground">
-                      • 性别: {filters.gender.join('、')}
-                    </p>
-                  )}
-                  {filters.experience && filters.experience.length > 0 && (
-                    <p className="text-sm text-muted-foreground">
-                      • 经验要求: {filters.experience.join('、')}
-                    </p>
-                  )}
-                  {filters.education && filters.education.length > 0 && (
-                    <p className="text-sm text-muted-foreground">
-                      • 学历要求: {filters.education.join('、')}
-                    </p>
-                  )}
-                  {filters.major && filters.major.length > 0 && (
-                    <p className="text-sm text-muted-foreground">
-                      • 专业: {filters.major.join('、')}
-                    </p>
-                  )}
-                  {filters.school && filters.school.length > 0 && (
-                    <p className="text-sm text-muted-foreground">
-                      • 院校: {filters.school.join('、')}
-                    </p>
-                  )}
-                  {filters.notRecentlyViewed && filters.notRecentlyViewed.length > 0 && (
-                    <p className="text-sm text-muted-foreground">
-                      • 近期没有看过: {filters.notRecentlyViewed.join('、')}
-                    </p>
-                  )}
-                  {filters.resumeExchange && filters.resumeExchange.length > 0 && (
-                    <p className="text-sm text-muted-foreground">
-                      • 与同事交换简历: {filters.resumeExchange.join('、')}
-                    </p>
-                  )}
-                  {filters.jobIntention && filters.jobIntention.length > 0 && (
-                    <p className="text-sm text-muted-foreground">
-                      • 求职意向: {filters.jobIntention.join('、')}
-                    </p>
-                  )}
-                  {filters.keywords && filters.keywords.length > 0 && (
-                    <p className="text-sm text-muted-foreground">
-                      • 关键词: {filters.keywords.join('、')}
-                    </p>
-                  )}
-                </div>
-              </div>
-
-              <div className="pt-4 border-t">
-                <Label className="text-muted-foreground">预计操作</Label>
-                <p className="font-medium">
-                  筛选条件已在浏览器中应用，将自动向符合条件的候选人发送问候
-                </p>
-                <p className="text-xs text-muted-foreground mt-2">
-                  💡 提示：如果返回修改筛选条件，需要重新应用
-                </p>
-              </div>
             </div>
 
             <div className="flex gap-4">
               <Button
                 variant="outline"
-                onClick={() => setCurrentStep('configure')}
+                onClick={() => {
+                  setCurrentStep('manual');
+                  startReadyStatePolling();
+                }}
                 disabled={greetingStarted}
               >
-                返回修改
+                返回
               </Button>
               <Button
                 variant="outline"
@@ -1330,11 +710,10 @@ export default function AutomationWizard() {
                 </div>
                 <p className="text-sm text-muted-foreground mt-2">
                   {greetingStatus.status === 'running' && `正在处理第 ${greetingStatus.current_index} 个候选人...`}
-                  {greetingStatus.status === 'completed' && `✅ 任务完成！成功 ${greetingStatus.success_count} 个，失败 ${greetingStatus.failed_count} 个${greetingStatus.skipped_count > 0 ? `，跳过 ${greetingStatus.skipped_count} 个` : ''}`}
+                  {greetingStatus.status === 'completed' && `任务完成！成功 ${greetingStatus.success_count} 个，失败 ${greetingStatus.failed_count} 个${greetingStatus.skipped_count > 0 ? `，跳过 ${greetingStatus.skipped_count} 个` : ''}`}
                   {greetingStatus.status === 'idle' && '等待开始...'}
                 </p>
 
-                {/* 统计信息 */}
                 <div className="grid grid-cols-3 gap-4 mt-4">
                   <div>
                     <p className="text-sm text-muted-foreground">成功数</p>
@@ -1415,13 +794,6 @@ export default function AutomationWizard() {
               <div className="text-sm text-muted-foreground">
                 <p>将保存以下配置：</p>
                 <ul className="list-disc list-inside mt-2 space-y-1">
-                  <li>浏览器显示模式：{showBrowser ? '显示窗口' : '后台运行'}</li>
-                  <li>职位：{availableJobs.find(j => j.value === selectedJobValue)?.label}</li>
-                  <li>筛选条件：{Object.entries(filters).filter(([key, value]) => {
-                    if (key === 'age') return value !== null;
-                    if (Array.isArray(value)) return value.length > 0;
-                    return value && value !== '不限';
-                  }).length} 项</li>
                   <li>打招呼数量：{maxContacts === '' ? 10 : maxContacts}</li>
                   {expectedPositions.length > 0 && (
                     <li>期望职位：{expectedPositions.join('、')}</li>
@@ -1478,8 +850,9 @@ export default function AutomationWizard() {
         </div>
       </div>
 
-      {/* 步骤指示器 */}
+      {/* 步骤指示器 - 3步 */}
       <div className="flex items-center justify-center gap-3 py-6">
+        {/* 步骤1: 启动浏览器 */}
         <div className="flex items-center gap-2">
           <div
             className={`flex items-center justify-center w-10 h-10 rounded-full border-2 ${
@@ -1495,81 +868,37 @@ export default function AutomationWizard() {
               currentStep === 'browser' ? 'text-primary' : 'text-muted-foreground'
             }`}
           >
-            浏览器
+            启动浏览器
           </span>
         </div>
 
-        <div className="w-12 h-0.5 bg-muted" />
+        <div className="w-16 h-0.5 bg-muted" />
 
+        {/* 步骤2: 手动操作 */}
         <div className="flex items-center gap-2">
           <div
             className={`flex items-center justify-center w-10 h-10 rounded-full border-2 ${
-              currentStep === 'login'
-                ? 'bg-primary text-primary-foreground border-primary'
-                : isLoggedIn
-                ? 'bg-blue-50 text-blue-700 border-blue-700'
-                : 'border-muted-foreground text-muted-foreground'
-            }`}
-          >
-            {isLoggedIn ? <CheckCircle2 className="h-5 w-5" /> : '2'}
-          </div>
-          <span
-            className={`font-medium text-sm ${
-              currentStep === 'login' ? 'text-primary' : 'text-muted-foreground'
-            }`}
-          >
-            登录
-          </span>
-        </div>
-
-        <div className="w-12 h-0.5 bg-muted" />
-
-        <div className="flex items-center gap-2">
-          <div
-            className={`flex items-center justify-center w-10 h-10 rounded-full border-2 ${
-              currentStep === 'job-select'
-                ? 'bg-primary text-primary-foreground border-primary'
-                : selectedJobValue
-                ? 'bg-blue-50 text-blue-700 border-blue-700'
-                : 'border-muted-foreground text-muted-foreground'
-            }`}
-          >
-            {selectedJobValue ? <CheckCircle2 className="h-5 w-5" /> : '3'}
-          </div>
-          <span
-            className={`font-medium text-sm ${
-              currentStep === 'job-select' ? 'text-primary' : 'text-muted-foreground'
-            }`}
-          >
-            职位
-          </span>
-        </div>
-
-        <div className="w-12 h-0.5 bg-muted" />
-
-        <div className="flex items-center gap-2">
-          <div
-            className={`flex items-center justify-center w-10 h-10 rounded-full border-2 ${
-              currentStep === 'configure'
+              currentStep === 'manual'
                 ? 'bg-primary text-primary-foreground border-primary'
                 : currentStep === 'confirm'
                 ? 'bg-blue-50 text-blue-700 border-blue-700'
                 : 'border-muted-foreground text-muted-foreground'
             }`}
           >
-            {currentStep === 'confirm' ? <CheckCircle2 className="h-5 w-5" /> : '4'}
+            {currentStep === 'confirm' ? <CheckCircle2 className="h-5 w-5" /> : '2'}
           </div>
           <span
             className={`font-medium text-sm ${
-              currentStep === 'configure' ? 'text-primary' : 'text-muted-foreground'
+              currentStep === 'manual' ? 'text-primary' : 'text-muted-foreground'
             }`}
           >
-            配置
+            手动操作
           </span>
         </div>
 
-        <div className="w-12 h-0.5 bg-muted" />
+        <div className="w-16 h-0.5 bg-muted" />
 
+        {/* 步骤3: 配置并启动 */}
         <div className="flex items-center gap-2">
           <div
             className={`flex items-center justify-center w-10 h-10 rounded-full border-2 ${
@@ -1578,23 +907,21 @@ export default function AutomationWizard() {
                 : 'border-muted-foreground text-muted-foreground'
             }`}
           >
-            5
+            3
           </div>
           <span
             className={`font-medium text-sm ${
               currentStep === 'confirm' ? 'text-primary' : 'text-muted-foreground'
             }`}
           >
-            启动
+            配置启动
           </span>
         </div>
       </div>
 
       {/* 步骤内容 */}
       {currentStep === 'browser' && renderBrowserStep()}
-      {currentStep === 'login' && renderLoginStep()}
-      {currentStep === 'job-select' && renderJobSelectStep()}
-      {currentStep === 'configure' && renderConfigureStep()}
+      {currentStep === 'manual' && renderManualStep()}
       {currentStep === 'confirm' && renderConfirmStep()}
     </div>
   );

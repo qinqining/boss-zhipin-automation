@@ -196,6 +196,15 @@ export default function AutomationWizard() {
         return;
       }
 
+      // 自动将输入框中未点击"添加"的内容纳入期望职位列表
+      let finalPositions = [...expectedPositions];
+      const trimmedInput = positionInput.trim();
+      if (trimmedInput && !finalPositions.includes(trimmedInput)) {
+        finalPositions.push(trimmedInput);
+        setExpectedPositions(finalPositions);
+        setPositionInput('');
+      }
+
       toast.info('正在启动打招呼任务...');
 
       const response = await fetch('/api/greeting/start', {
@@ -205,7 +214,7 @@ export default function AutomationWizard() {
         },
         body: JSON.stringify({
           target_count: targetCount,
-          expected_positions: expectedPositions
+          expected_positions: finalPositions
         })
       });
 

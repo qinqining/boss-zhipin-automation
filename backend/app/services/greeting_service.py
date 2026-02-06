@@ -108,25 +108,6 @@ class GreetingTaskManager:
         """获取最近的日志"""
         return list(self.logs)[-last_n:]
 
-    def reset(self):
-        """重置状态（日志文件保留，不删除）"""
-        self.status = "idle"
-        self.target_count = 0
-        self.current_index = 0
-        self.success_count = 0
-        self.failed_count = 0
-        self.skipped_count = 0
-        self.start_time = None
-        self.end_time = None
-        self.logs.clear()
-        self.error_message = None
-        self.expected_positions = []
-        self.limit_reached = False
-        # 日志文件路径清除（文件本身保留）
-        self.log_file_path = None
-        if self.automation:
-            self.automation = None
-
     async def start_greeting_task(self, target_count: int, automation_service=None, expected_positions: List[str] = None):
         """启动打招呼任务
 
@@ -271,14 +252,15 @@ class GreetingTaskManager:
                             continue
 
                         # 检查期望职位是否匹配
+                        display_pos = expected_pos.replace('|', ' / ')
                         if not self._match_position(expected_pos, self.expected_positions):
                             # 职位不匹配，跳过
                             self.skipped_count += 1
-                            self.add_log("INFO", f"⏭️  {candidate_name}: 期望职位不匹配({expected_pos})，已跳过")
+                            self.add_log("INFO", f"⏭️  {candidate_name}: 期望职位不匹配({display_pos})，已跳过")
                             continue
 
                         # 职位匹配，记录日志
-                        self.add_log("INFO", f"✅ {candidate_name}: 期望职位匹配({expected_pos})")
+                        self.add_log("INFO", f"✅ {candidate_name}: 期望职位匹配({display_pos})")
 
                     self.add_log("INFO", f"🖱️  准备点击候选人: {candidate_name}")
 
@@ -493,7 +475,8 @@ class GreetingTaskManager:
     async def _extract_expected_position(self, card) -> Optional[str]:
         """
         从候选人卡片提取期望职位
-        使用JavaScript提取文本节点，跳过HTML分隔符元素
+        Boss直聘 DOM 结构：
+          div.row.row-flex.expect-wrap > span.content > div > span（多个span包含城市、职位等）
 
         Args:
             card: Playwright locator对象，候选人卡片
@@ -502,29 +485,43 @@ class GreetingTaskManager:
             期望职位字符串，如果提取失败则返回None
         """
         try:
-            # 使用JavaScript提取文本节点（和get_candidates_info_final.py相同的方法）
             result = await card.evaluate("""
                 (el) => {
-                    function extractJoinTextParts(element) {
-                        if (!element) return [];
-                        const parts = [];
-                        for (const child of element.childNodes) {
-                            if (child.nodeType === Node.TEXT_NODE) {
-                                const text = child.textContent.trim();
-                                if (text) {
-                                    parts.push(text);
-                                }
+                    // 新版DOM结构: .row-flex.expect-wrap > span.content > div > span
+                    let contentEl = el.querySelector('.row-flex.expect-wrap span.content');
+                    if (contentEl) {
+                        // 获取所有 span 文本（通常包含城市、职位等）
+                        const spans = contentEl.querySelectorAll('span');
+                        if (spans.length > 0) {
+                            // 收集所有 span 文本
+                            const texts = [];
+                            for (const span of spans) {
+                                const text = span.textContent.trim();
+                                if (text) texts.push(text);
                             }
+                            // 通常 texts = ["城市", "薪资", "职位"] 或类似排列
+                            // 返回所有文本用 | 分隔，在匹配时逐个检查
+                            return texts.join('|');
                         }
-                        return parts;
+                        // 没有 span 子元素，直接取文本
+                        const text = contentEl.textContent.trim();
+                        if (text) return text;
                     }
 
-                    const expectRow = el.querySelector('.row-flex .content .join-text-wrap');
-                    if (!expectRow) return null;
+                    // 旧版DOM结构回退: .row-flex .content .join-text-wrap
+                    let expectRow = el.querySelector('.row-flex .content .join-text-wrap');
+                    if (expectRow) {
+                        const parts = [];
+                        for (const child of expectRow.childNodes) {
+                            if (child.nodeType === Node.TEXT_NODE) {
+                                const text = child.textContent.trim();
+                                if (text) parts.push(text);
+                            }
+                        }
+                        return parts.length > 1 ? parts[1] : (parts[0] || null);
+                    }
 
-                    const parts = extractJoinTextParts(expectRow);
-                    // parts[0] 是城市，parts[1] 是职位
-                    return parts.length > 1 ? parts[1] : null;
+                    return null;
                 }
             """)
 
@@ -537,10 +534,11 @@ class GreetingTaskManager:
 
     def _match_position(self, candidate_pos: str, expected_list: List[str]) -> bool:
         """
-        包含匹配：候选人期望职位包含任一配置关键词即匹配
+        包含匹配：候选人期望职位文本包含任一配置关键词即匹配
+        candidate_pos 可能是 | 分隔的多段文本（城市|薪资|职位等）
 
         Args:
-            candidate_pos: 候选人的期望职位
+            candidate_pos: 候选人的期望职位文本（可能含 | 分隔符）
             expected_list: 期望职位关键词列表
 
         Returns:
@@ -549,10 +547,13 @@ class GreetingTaskManager:
         if not candidate_pos or not expected_list:
             return False
 
-        candidate_pos_lower = candidate_pos.lower()
+        # 将 | 分隔的文本拆开逐段匹配
+        segments = candidate_pos.split('|')
         for expected in expected_list:
-            if expected.lower() in candidate_pos_lower:
-                return True
+            expected_lower = expected.lower()
+            for segment in segments:
+                if expected_lower in segment.lower():
+                    return True
 
         return False
 
@@ -785,9 +786,7 @@ class GreetingTaskManager:
         return False
 
     def reset(self):
-        """
-        重置任务状态（用于异常恢复）
-        """
+        """重置任务状态"""
         logger.warning("🔄 正在重置任务状态...")
 
         # 取消正在运行的任务
@@ -797,12 +796,22 @@ class GreetingTaskManager:
 
         # 重置所有状态
         self.status = "idle"
-        self.error_message = None
+        self.target_count = 0
+        self.current_index = 0
+        self.success_count = 0
+        self.failed_count = 0
+        self.skipped_count = 0
         self.start_time = None
         self.end_time = None
+        self.logs.clear()
+        self.error_message = None
+        self.expected_positions = []
+        self.limit_reached = False
+        self.log_file_path = None
         self.task = None
+        if self.automation:
+            self.automation = None
 
-        # 保留统计和日志，以便查看历史
         logger.info("✅ 任务状态已重置")
 
 

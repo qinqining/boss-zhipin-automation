@@ -102,13 +102,42 @@ class BossAutomation:
             logger.info("✅ 浏览器初始化成功")
 
             if skip_auto_navigate:
-                # 手动模式：只访问首页，不自动执行登录/导航逻辑
-                logger.info("📌 手动模式：只访问首页，跳过自动导航")
+                # 手动模式：先访问首页
+                logger.info("📌 手动模式：启动浏览器")
                 try:
                     await self.page.goto(self.base_url, wait_until='domcontentloaded', timeout=20000)
                     logger.info("✅ 已打开 Boss 直聘首页")
                 except Exception as e:
                     logger.warning(f"⚠️ 访问首页失败: {str(e)}")
+
+                # 如果加载了 cookies，验证是否有效，有效则直接导航到推荐牛人页面
+                if self.auth_file and os.path.exists(self.auth_file):
+                    logger.info("🔍 检测已加载 cookies，验证登录状态...")
+                    try:
+                        api_url = "https://www.zhipin.com/wapi/zpboss/h5/user/info"
+                        response = await self.page.evaluate(f'''
+                            async () => {{
+                                try {{
+                                    const resp = await fetch("{api_url}");
+                                    return await resp.json();
+                                }} catch(e) {{
+                                    return {{ code: -1 }};
+                                }}
+                            }}
+                        ''')
+                        if response.get('code') == 0:
+                            zp_data = response.get('zpData', {})
+                            base_info = zp_data.get('baseInfo', {})
+                            if base_info.get('comId'):
+                                self.is_logged_in = True
+                                logger.info(f"✅ Cookies 有效，用户: {base_info.get('showName')}，自动导航到推荐牛人页面")
+                                await self.navigate_to_recommend_page()
+                            else:
+                                logger.info("⚠️ Cookies 已过期，需要手动登录")
+                        else:
+                            logger.info("⚠️ Cookies 已过期，需要手动登录")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 验证 cookies 失败: {str(e)}，需要手动登录")
             else:
                 # 自动模式：准备登录页面（原有逻辑）
                 await self.prepare_login_page()

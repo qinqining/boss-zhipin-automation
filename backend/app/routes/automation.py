@@ -517,9 +517,16 @@ async def check_ready_state():
                 has_frame = True
                 break
 
-        # 检测登录状态（通过 API + DOM 双重验证）
+        # 检测页面是否在验证/登录拦截页（即使 API cookies 有效也不算真正可用）
+        is_on_blocked_page = any(kw in current_url for kw in [
+            'verify-slider', 'verify-phone', 'safe/verify',
+            'web/user/', 'login', 'captcha'
+        ])
+        if is_on_blocked_page:
+            logger.info(f"⚠️ 当前在验证/登录拦截页: {current_url}，需要手动处理")
+
+        # 检测登录状态（通过 API）
         try:
-            # 方法1：通过 API 检测
             api_url = "https://www.zhipin.com/wapi/zpboss/h5/user/info"
             response = await page.evaluate(f'''
                 async () => {{
@@ -532,15 +539,15 @@ async def check_ready_state():
                 }}
             ''')
 
-            logger.info(f"🔍 check-ready-state API 响应 code={response.get('code')}")
+            logger.info(f"🔍 check-ready-state API code={response.get('code')}, on_blocked={is_on_blocked_page}")
 
             if response.get('code') == 0:
                 zp_data = response.get('zpData', {})
                 base_info = zp_data.get('baseInfo', {})
                 com_id = base_info.get('comId')
 
-                # 必须有实际用户数据（comId）才算真正登录
-                if com_id:
+                # 必须有 comId + 不在拦截页面 才算真正登录可用
+                if com_id and not is_on_blocked_page:
                     logged_in = True
                     _automation_service.is_logged_in = True
                     user_info = {
@@ -550,9 +557,9 @@ async def check_ready_state():
                         'avatar': base_info.get('avatar'),
                         'title': base_info.get('title'),
                     }
-                    logger.info(f"✅ API 验证已登录: {base_info.get('showName')} (comId={com_id})")
+                    logger.info(f"✅ 已登录: {base_info.get('showName')} (comId={com_id})")
 
-                    # 如果是新登录，保存认证状态
+                    # 保存认证状态
                     if not _automation_service.auth_file:
                         _automation_service.current_com_id = com_id
                         _automation_service.auth_file = _automation_service.get_auth_file_path(com_id)
@@ -568,44 +575,18 @@ async def check_ready_state():
                         await _automation_service._save_account_info(response)
                     except Exception:
                         pass
+                elif com_id and is_on_blocked_page:
+                    # API 有效但页面被拦截，提取用户信息但不标记为已登录
+                    user_info = {
+                        'comId': com_id,
+                        'name': base_info.get('name'),
+                        'showName': base_info.get('showName'),
+                        'avatar': base_info.get('avatar'),
+                        'title': base_info.get('title'),
+                    }
+                    logger.info(f"⚠️ API 有效但在拦截页，需先完成验证: {base_info.get('showName')}")
                 else:
-                    logger.info("⚠️ API 返回 code=0 但无 comId，判定为未登录")
-
-            # 方法2：如果 API 判定未登录，再通过 DOM 检查页面上是否有登录按钮
-            if not logged_in:
-                try:
-                    login_btn = await page.query_selector('#header .user-nav a[href*="login"], #header .user-nav a[ka*="login"]')
-                    if login_btn:
-                        logger.info("🔍 DOM 检测到登录按钮，确认未登录")
-                    else:
-                        # 没有登录按钮 + 不在登录页面 = 可能已登录但 API 失败
-                        if 'zhipin.com/web/user/' not in current_url:
-                            logger.info("🔍 DOM 未找到登录按钮且不在登录页，尝试备用 API")
-                            # 尝试备用 API
-                            backup_response = await page.evaluate('''
-                                async () => {
-                                    try {
-                                        const response = await fetch("https://www.zhipin.com/wapi/zpuser/wap/getUserInfo.json");
-                                        return await response.json();
-                                    } catch(e) {
-                                        return { code: -1 };
-                                    }
-                                }
-                            ''')
-                            if backup_response.get('code') == 0:
-                                backup_data = backup_response.get('zpData', {})
-                                if backup_data.get('userId'):
-                                    logged_in = True
-                                    _automation_service.is_logged_in = True
-                                    user_info = {
-                                        'comId': backup_data.get('comId'),
-                                        'name': backup_data.get('name'),
-                                        'showName': backup_data.get('showName'),
-                                        'avatar': backup_data.get('largeAvatar'),
-                                    }
-                                    logger.info(f"✅ 备用 API 验证已登录: {backup_data.get('showName')}")
-                except Exception as dom_err:
-                    logger.warning(f"⚠️ DOM 检测失败: {str(dom_err)}")
+                    logger.info("⚠️ API code=0 但无 comId，未登录")
         except Exception as e:
             logger.warning(f"⚠️ 检查登录状态失败: {str(e)}")
 
@@ -616,9 +597,10 @@ async def check_ready_state():
             "logged_in": logged_in,
             "on_recommend_page": on_recommend_page,
             "has_frame": has_frame,
+            "needs_verification": is_on_blocked_page,
             "user_info": user_info,
             "current_url": current_url,
-            "message": "就绪" if ready else "等待用户操作"
+            "message": "就绪" if ready else ("请在浏览器中完成安全验证" if is_on_blocked_page else "等待用户操作")
         }
 
     except Exception as e:

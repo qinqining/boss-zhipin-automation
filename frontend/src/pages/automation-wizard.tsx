@@ -68,6 +68,7 @@ export default function AutomationWizard() {
     logged_in: false,
     on_recommend_page: false,
     has_frame: false,
+    needs_verification: false,
   });
   const [userInfo, setUserInfo] = useState<any>(null);
   const readyPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -143,6 +144,7 @@ export default function AutomationWizard() {
           logged_in: state.logged_in,
           on_recommend_page: state.on_recommend_page,
           has_frame: state.has_frame,
+          needs_verification: state.needs_verification || false,
         });
 
         if (state.user_info) {
@@ -475,13 +477,25 @@ export default function AutomationWizard() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
+          {/* 安全验证提示 */}
+          {readyState.needs_verification && (
+            <div className="bg-red-50 dark:bg-red-950 p-4 rounded-lg border border-red-200 dark:border-red-800">
+              <h4 className="font-medium text-red-900 dark:text-red-100 mb-2">
+                需要完成安全验证
+              </h4>
+              <p className="text-sm text-red-800 dark:text-red-200">
+                浏览器中出现了滑块验证或安全检查，请在浏览器中手动完成验证后继续。
+              </p>
+            </div>
+          )}
+
           {/* 操作指引 */}
           <div className="bg-amber-50 dark:bg-amber-950 p-4 rounded-lg">
             <h4 className="font-medium text-amber-900 dark:text-amber-100 mb-3">
               请在浏览器中完成以下操作：
             </h4>
             <ol className="text-sm text-amber-800 dark:text-amber-200 space-y-2 list-decimal list-inside">
-              <li>登录 Boss 直聘账号（扫码或手机号登录）</li>
+              <li>登录 Boss 直聘账号（如遇到验证滑块，请先完成验证）</li>
               <li>进入"推荐牛人"页面</li>
               <li>选择招聘职位</li>
               <li>设置筛选条件（如需要）</li>

@@ -1,10 +1,14 @@
 """
 打招呼自动化API路由
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import Dict, List, Optional
+from sqlmodel import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.greeting_service import greeting_manager
+from app.database import get_session
+from app.models.position_keyword import PositionKeyword
 
 # 导入全局自动化服务
 import sys
@@ -48,7 +52,7 @@ class GreetingLogsResponse(BaseModel):
 
 
 @router.post("/start", summary="开始打招呼任务")
-async def start_greeting(request: StartGreetingRequest):
+async def start_greeting(request: StartGreetingRequest, session: AsyncSession = Depends(get_session)):
     """
     启动自动打招呼任务
 
@@ -77,6 +81,20 @@ async def start_greeting(request: StartGreetingRequest):
 
         if not automation.page:
             raise HTTPException(status_code=400, detail="浏览器未初始化，请先在向导中初始化浏览器")
+
+        # 自动保存期望职位关键词到数据库
+        for pos_name in request.expected_positions:
+            pos_name = pos_name.strip()
+            if not pos_name:
+                continue
+            stmt = select(PositionKeyword).where(PositionKeyword.name == pos_name)
+            result = await session.execute(stmt)
+            existing = result.scalars().first()
+            if existing:
+                existing.usage_count += 1
+            else:
+                session.add(PositionKeyword(name=pos_name, usage_count=1))
+        await session.commit()
 
         # 启动任务（传入已有的自动化服务和期望职位列表）
         await greeting_manager.start_greeting_task(

@@ -34,6 +34,7 @@ async def init_db():
     from app.models.notification_config import NotificationConfig
     from app.models.filters import FilterOptions
     from app.models.automation_template import AutomationTemplate
+    from app.models.position_keyword import PositionKeyword
 
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)

@@ -11,6 +11,7 @@ import { toast } from 'sonner';
 import { useAutomation } from '@/hooks/useAutomation';
 import { useAutomationTemplates } from '@/hooks/useAutomationTemplates';
 import { useAccounts } from '@/hooks/useAccounts';
+import { usePositionKeywords, type PositionKeyword } from '@/hooks/usePositionKeywords';
 import type { GreetingStatus, GreetingLogEntry } from '@/types';
 import type { UserAccount } from '@/types/account';
 
@@ -44,6 +45,7 @@ export default function AutomationWizard() {
   const { initBrowser, checkReadyState } = useAutomation();
   const { createTemplate } = useAutomationTemplates();
   const { getAccounts } = useAccounts();
+  const { searchKeywords, deleteKeyword } = usePositionKeywords();
 
   // 步骤状态
   const [currentStep, setCurrentStep] = useState<WizardStep>('browser');
@@ -85,6 +87,12 @@ export default function AutomationWizard() {
   // 期望职位匹配相关状态
   const [expectedPositions, setExpectedPositions] = useState<string[]>([]);
   const [positionInput, setPositionInput] = useState('');
+  const [keywordSuggestions, setKeywordSuggestions] = useState<PositionKeyword[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(-1);
+  const suggestionsRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 页面加载时获取账号列表
   useEffect(() => {
@@ -166,13 +174,51 @@ export default function AutomationWizard() {
   }, [checkReadyState]);
 
   /**
+   * 搜索关键词（防抖）
+   */
+  const handlePositionInputChange = (value: string) => {
+    setPositionInput(value);
+    setSelectedSuggestionIndex(-1);
+
+    if (searchTimerRef.current) {
+      clearTimeout(searchTimerRef.current);
+    }
+
+    if (value.trim()) {
+      searchTimerRef.current = setTimeout(async () => {
+        try {
+          const results = await searchKeywords(value.trim());
+          setKeywordSuggestions(results);
+          setShowSuggestions(true);
+        } catch {
+          setKeywordSuggestions([]);
+        }
+      }, 300);
+    } else {
+      // 输入为空时也加载历史关键词
+      searchTimerRef.current = setTimeout(async () => {
+        try {
+          const results = await searchKeywords('');
+          setKeywordSuggestions(results);
+          setShowSuggestions(results.length > 0);
+        } catch {
+          setKeywordSuggestions([]);
+        }
+      }, 300);
+    }
+  };
+
+  /**
    * 添加期望职位
    */
-  const handleAddPosition = () => {
-    const trimmed = positionInput.trim();
+  const handleAddPosition = (name?: string) => {
+    const trimmed = (name || positionInput).trim();
     if (trimmed && !expectedPositions.includes(trimmed)) {
       setExpectedPositions([...expectedPositions, trimmed]);
       setPositionInput('');
+      setShowSuggestions(false);
+      setKeywordSuggestions([]);
+      setSelectedSuggestionIndex(-1);
     } else if (expectedPositions.includes(trimmed)) {
       toast.warning('该职位已添加');
     }
@@ -183,6 +229,62 @@ export default function AutomationWizard() {
    */
   const handleRemovePosition = (index: number) => {
     setExpectedPositions(expectedPositions.filter((_, i) => i !== index));
+  };
+
+  /**
+   * 删除历史关键词
+   */
+  const handleDeleteKeyword = async (e: React.MouseEvent, id: number) => {
+    e.stopPropagation();
+    try {
+      await deleteKeyword(id);
+      setKeywordSuggestions(prev => prev.filter(k => k.id !== id));
+      toast.success('已删除历史关键词');
+    } catch {
+      toast.error('删除失败');
+    }
+  };
+
+  /**
+   * 处理键盘导航
+   */
+  const handlePositionKeyDown = (e: React.KeyboardEvent) => {
+    const filteredSuggestions = keywordSuggestions.filter(
+      k => !expectedPositions.includes(k.name)
+    );
+    const trimmed = positionInput.trim();
+    const hasCreateOption = trimmed && !filteredSuggestions.some(k => k.name === trimmed);
+    const totalItems = filteredSuggestions.length + (hasCreateOption ? 1 : 0);
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (showSuggestions && totalItems > 0) {
+        setSelectedSuggestionIndex(prev =>
+          prev < totalItems - 1 ? prev + 1 : 0
+        );
+      }
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (showSuggestions && totalItems > 0) {
+        setSelectedSuggestionIndex(prev =>
+          prev > 0 ? prev - 1 : totalItems - 1
+        );
+      }
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (selectedSuggestionIndex >= 0 && showSuggestions) {
+        if (selectedSuggestionIndex < filteredSuggestions.length) {
+          handleAddPosition(filteredSuggestions[selectedSuggestionIndex].name);
+        } else if (hasCreateOption) {
+          handleAddPosition(trimmed);
+        }
+      } else {
+        handleAddPosition();
+      }
+    } else if (e.key === 'Escape') {
+      setShowSuggestions(false);
+      setSelectedSuggestionIndex(-1);
+    }
   };
 
   /**
@@ -313,7 +415,27 @@ export default function AutomationWizard() {
       if (readyPollingRef.current) {
         clearInterval(readyPollingRef.current);
       }
+      if (searchTimerRef.current) {
+        clearTimeout(searchTimerRef.current);
+      }
     };
+  }, []);
+
+  // 点击外部关闭下拉
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (
+        suggestionsRef.current &&
+        !suggestionsRef.current.contains(e.target as Node) &&
+        inputRef.current &&
+        !inputRef.current.contains(e.target as Node)
+      ) {
+        setShowSuggestions(false);
+        setSelectedSuggestionIndex(-1);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
   // 从模板加载配置
@@ -721,29 +843,87 @@ export default function AutomationWizard() {
               <div className="space-y-2">
                 <Label>期望职位匹配（可选）</Label>
                 <p className="text-sm text-muted-foreground">
-                  只向期望职位包含以下关键词的候选人打招呼
+                  只向期望职位包含以下关键词的候选人打招呼，支持搜索历史关键词
                 </p>
 
-                <div className="flex gap-2">
-                  <Input
-                    placeholder="输入职位关键词，如：Java、产品经理"
-                    value={positionInput}
-                    onChange={(e) => setPositionInput(e.target.value)}
-                    onKeyPress={(e) => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault();
-                        handleAddPosition();
-                      }
-                    }}
-                    className="flex-1"
-                  />
-                  <Button
-                    type="button"
-                    onClick={handleAddPosition}
-                    variant="outline"
-                  >
-                    添加
-                  </Button>
+                <div className="relative">
+                  <div className="flex gap-2">
+                    <Input
+                      ref={inputRef}
+                      placeholder="输入职位关键词，如：Java、产品经理"
+                      value={positionInput}
+                      onChange={(e) => handlePositionInputChange(e.target.value)}
+                      onKeyDown={handlePositionKeyDown}
+                      onFocus={() => {
+                        // 聚焦时加载历史关键词
+                        if (keywordSuggestions.length > 0) {
+                          setShowSuggestions(true);
+                        } else {
+                          handlePositionInputChange(positionInput);
+                        }
+                      }}
+                      className="flex-1"
+                    />
+                    <Button
+                      type="button"
+                      onClick={() => handleAddPosition()}
+                      variant="outline"
+                    >
+                      添加
+                    </Button>
+                  </div>
+
+                  {/* 搜索建议下拉列表 */}
+                  {showSuggestions && (() => {
+                    const filteredSuggestions = keywordSuggestions.filter(
+                      k => !expectedPositions.includes(k.name)
+                    );
+                    const trimmed = positionInput.trim();
+                    const hasCreateOption = trimmed && !filteredSuggestions.some(k => k.name === trimmed);
+                    const hasItems = filteredSuggestions.length > 0 || hasCreateOption;
+
+                    if (!hasItems) return null;
+
+                    return (
+                      <div
+                        ref={suggestionsRef}
+                        className="absolute z-50 top-full left-0 right-12 mt-1 bg-popover border rounded-md shadow-md max-h-48 overflow-y-auto"
+                      >
+                        {filteredSuggestions.map((keyword, index) => (
+                          <div
+                            key={keyword.id}
+                            className={`flex items-center justify-between px-3 py-2 text-sm cursor-pointer hover:bg-accent ${
+                              selectedSuggestionIndex === index ? 'bg-accent' : ''
+                            }`}
+                            onClick={() => handleAddPosition(keyword.name)}
+                          >
+                            <span>{keyword.name}</span>
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs text-muted-foreground">
+                                使用 {keyword.usage_count} 次
+                              </span>
+                              <X
+                                className="h-3 w-3 text-muted-foreground hover:text-red-600"
+                                onClick={(e) => handleDeleteKeyword(e, keyword.id)}
+                              />
+                            </div>
+                          </div>
+                        ))}
+                        {hasCreateOption && (
+                          <div
+                            className={`flex items-center px-3 py-2 text-sm cursor-pointer hover:bg-accent border-t ${
+                              selectedSuggestionIndex === filteredSuggestions.length ? 'bg-accent' : ''
+                            }`}
+                            onClick={() => handleAddPosition(trimmed)}
+                          >
+                            <span className="text-primary">
+                              创建 "{trimmed}"
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
 
                 {expectedPositions.length > 0 && (

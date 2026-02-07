@@ -39,7 +39,7 @@ async def health_check():
 
 
 # 导入并注册路由
-from app.routes import automation, candidates, templates, config, logs, greeting, accounts, notification, automation_templates
+from app.routes import automation, candidates, templates, config, logs, greeting, accounts, notification, automation_templates, position_keywords
 
 app.include_router(automation.router)
 app.include_router(candidates.router)
@@ -50,6 +50,7 @@ app.include_router(logs.router)
 app.include_router(greeting.router)
 app.include_router(accounts.router)
 app.include_router(notification.router)
+app.include_router(position_keywords.router)
 
 # 挂载前端静态文件(必须在所有API路由之后)
 frontend_dist = Path(__file__).parent.parent.parent / "frontend" / "dist"

@@ -6,7 +6,12 @@ from pathlib import Path
 
 from app.database import init_db
 
+import sys
+import asyncio
 
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""

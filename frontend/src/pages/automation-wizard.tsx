@@ -145,7 +145,7 @@ export default function AutomationWizard() {
       clearInterval(readyPollingRef.current);
     }
 
-    readyPollingRef.current = setInterval(async () => {
+    const pollOnce = async () => {
       try {
         const state = await checkReadyState();
         setReadyState({
@@ -170,7 +170,12 @@ export default function AutomationWizard() {
       } catch (error) {
         // 静默忽略轮询错误
       }
-    }, 3000);
+    };
+
+    // 先立刻检查一次，避免等第一个间隔
+    void pollOnce();
+    // 降低轮询频率，减少对登录页的“刷新感”
+    readyPollingRef.current = setInterval(pollOnce, 8000);
   }, [checkReadyState]);
 
   /**

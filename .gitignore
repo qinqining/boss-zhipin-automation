@@ -99,3 +99,5 @@ electron-app/*.dmg
 electron-app/*.app
 electron-app/*.zip
 backend/.boss_chrome_profile/
+.boss_real_chrome_profile/
+backend/.boss_real_chrome_profile/

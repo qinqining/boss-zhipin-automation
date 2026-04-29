@@ -36,6 +36,12 @@ if %errorlevel% neq 0 (
 
 cd /d "%BACKEND_DIR%"
 
+:: ========= 回退开关（无 git 环境用） =========
+:: 采用最稳组合：真实 Chrome + CDP 附加 + 手动最小模式（最接近 open_boss_no_refresh）
+set "MANUAL_CDP_ATTACH=1"
+set "MANUAL_MINIMAL=1"
+:: ============================================
+
 :: 检查虚拟环境
 if not exist ".venv" (
     echo [信息] 首次运行，正在安装依赖...

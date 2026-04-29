@@ -7,6 +7,7 @@ import asyncio
 import logging
 import sys
 import time
+import subprocess
 from typing import Optional, Dict, List
 from datetime import datetime
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
@@ -57,6 +58,10 @@ class BossAutomation:
         self._manual_last_recover_ts: float = 0.0
         self._manual_guard_task: Optional[asyncio.Task] = None
         self._manual_nav_lock_enabled: bool = False
+        self._manual_guard_enabled: bool = False
+        # 与 API 轮询共享的“浏览器会话锁”（用于避免并发 goto/evaluate 导致 about:blank）
+        self._external_session_lock: Optional[asyncio.Lock] = None
+        self._manual_attached_via_cdp: bool = False
 
         # 配置项
         self.base_url = "https://www.zhipin.com"
@@ -71,6 +76,207 @@ class BossAutomation:
             logger.info(f"🔎 STEP[{self._step_seq:03d}] {tag} | {extras}")
         else:
             logger.info(f"🔎 STEP[{self._step_seq:03d}] {tag}")
+
+    def set_session_lock(self, lock: asyncio.Lock) -> None:
+        """注入外部会话锁（通常来自路由层的全局锁），用于串行化导航与 evaluate。"""
+        self._external_session_lock = lock
+
+    @staticmethod
+    def _is_verification_or_risk_url(url: str) -> bool:
+        """识别安全验证/风控链路页面（遇到这类页面不要强行拉回登录页）。"""
+        u = (url or "").lower()
+        if not u:
+            return False
+        keywords = (
+            "verify-slider",
+            "verify-phone",
+            "safe/verify",
+            "passport/zp/verify",
+            "_security_check",
+            "captcha",
+        )
+        return any(k in u for k in keywords)
+
+    async def _goto_locked(self, url: str, **kwargs) -> None:
+        """在外部锁保护下执行 goto，避免与 check-ready-state 并发打断。"""
+        if self._external_session_lock is None:
+            await self.page.goto(url, **kwargs)  # type: ignore[union-attr]
+            return
+        async with self._external_session_lock:
+            await self.page.goto(url, **kwargs)  # type: ignore[union-attr]
+
+    # ---------------------------
+    # 手动模式：真实 Chrome + CDP 附加（更像 open_boss_chrome.bat，稳定优先）
+    # ---------------------------
+    def _get_real_chrome_exe(self) -> Optional[str]:
+        """Windows：定位系统 Chrome 可执行文件。"""
+        if os.name != "nt":
+            return None
+        candidates = [
+            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), r"Google\Chrome\Application\chrome.exe"),
+            os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), r"Google\Chrome\Application\chrome.exe"),
+        ]
+        for p in candidates:
+            if p and os.path.exists(p):
+                return p
+        return None
+
+    def _is_cdp_port_open(self, port: int) -> bool:
+        """检查本机端口是否已被监听（用于判断是否已有 Chrome 调试实例在跑）。"""
+        import socket
+
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.4):
+                return True
+        except Exception:
+            return False
+
+    def _launch_real_chrome_with_cdp(self, url: str, user_data_dir: str) -> bool:
+        """启动真实 Chrome（独立 profile）并开启 remote debugging（随机端口）。
+
+        使用 --remote-debugging-port=0 让 Chrome 随机选端口，然后从 DevToolsActivePort 文件读取，
+        避免固定 9222 被站点安全脚本探测（你日志里已经看到它会尝试连 ws://127.0.0.1:9222 并 403）。
+        """
+        chrome = self._get_real_chrome_exe()
+        if not chrome:
+            return False
+
+        try:
+            os.makedirs(user_data_dir, exist_ok=True)
+        except Exception:
+            return False
+
+        args = [
+            chrome,
+            f"--user-data-dir={user_data_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-popup-blocking",
+            "--disable-extensions",
+            "--disable-component-extensions-with-background-pages",
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=0",
+            url,
+        ]
+
+        try:
+            subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
+            return True
+        except Exception:
+            return False
+
+    def _read_devtools_active_port(self, user_data_dir: str) -> Optional[int]:
+        """读取 Chrome 随机调试端口：<profile>/DevToolsActivePort 第一行是端口号。"""
+        try:
+            path = os.path.join(user_data_dir, "DevToolsActivePort")
+            if not os.path.exists(path):
+                return None
+            with open(path, "r", encoding="utf-8") as f:
+                first = (f.readline() or "").strip()
+            return int(first) if first.isdigit() else None
+        except Exception:
+            return None
+
+    async def _try_attach_to_real_chrome(self, url: str) -> bool:
+        """手动模式：启动真实 Chrome 并通过 CDP 附加，避免 Playwright launch 导致 blank/乱跳。"""
+        if os.name != "nt" or not self.playwright:
+            return False
+
+        profile_dir = os.path.abspath(os.path.join(os.getcwd(), ".boss_real_chrome_profile"))
+        # 允许用户指定固定端口（不推荐）；默认走随机端口
+        fixed_port_env = os.getenv("MANUAL_CDP_PORT", "").strip()
+        fixed_port = int(fixed_port_env) if fixed_port_env.isdigit() else None
+
+        port: Optional[int] = None
+        if fixed_port is not None:
+            port = fixed_port
+            if not self._is_cdp_port_open(port):
+                # 固定端口模式：仍然按固定端口启动（与历史兼容）
+                started = self._launch_real_chrome_with_cdp(url=url, user_data_dir=profile_dir)
+                if not started:
+                    return False
+                for _ in range(80):
+                    if self._is_cdp_port_open(port):
+                        break
+                    await asyncio.sleep(0.1)
+        else:
+            # 随机端口模式：若已存在 DevToolsActivePort 且端口可用，优先复用；否则拉起新 Chrome
+            port = self._read_devtools_active_port(profile_dir)
+            if port is None or not self._is_cdp_port_open(port):
+                started = self._launch_real_chrome_with_cdp(url=url, user_data_dir=profile_dir)
+                if not started:
+                    return False
+                # 等待 DevToolsActivePort 写入 & 端口监听
+                for _ in range(120):
+                    port = self._read_devtools_active_port(profile_dir)
+                    if port and self._is_cdp_port_open(port):
+                        break
+                    await asyncio.sleep(0.1)
+
+        if not port or not self._is_cdp_port_open(port):
+            return False
+
+        try:
+            browser = await self.playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        except Exception:
+            return False
+
+        contexts = browser.contexts
+        context = contexts[0] if contexts else await browser.new_context()
+
+        # CDP 模式尽量“像 open_boss_chrome.bat / no_refresh”：
+        # - 不注入 stealth（它会改 navigator.webdriver，容易触发 “Cannot redefine property: webdriver”）
+        # - 不注入 webdriver 相关 init_script
+        # - 尽量复用现有 tab（真实浏览器更稳定），找不到再新开
+        page = None
+        try:
+            for p in context.pages:
+                try:
+                    u = p.url or ""
+                except Exception:
+                    u = ""
+                if "zhipin.com" in u and u != "about:blank":
+                    page = p
+                    break
+        except Exception:
+            page = None
+
+        if page is None:
+            page = await context.new_page()
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception:
+                pass
+
+        self.browser = browser
+        self.context = context
+        self.page = page
+        # 依赖外部 profile/真实 Chrome，清理时不要强行 close browser
+        self._using_persistent_profile = True
+        self._log_step("initialize.cdp_attach.ok", port=port, url=self.page.url if self.page else None)
+        self._manual_attached_via_cdp = True
+        return True
+
+    async def _cdp_reopen_page(self, url: str, reason: str) -> None:
+        """CDP 附加模式：page 被关闭时，重新开一个新 page 并回到指定 URL。"""
+        try:
+            if not self.context:
+                return
+            self._log_step("cdp.page.reopen.begin", reason=reason, url=url)
+            page = await self.context.new_page()
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception:
+                pass
+            self.page = page
+            self._log_step("cdp.page.reopen.done", current_url=self.page.url if self.page else None)
+        except Exception:
+            return
 
     async def _trace_url_window(self, label: str, samples: int = 10, interval_s: float = 0.3):
         """短时间高频采样当前 URL，抓“瞬间跳转到 blank”窗口。"""
@@ -101,6 +307,10 @@ class BossAutomation:
                 except Exception:
                     current = ""
 
+                # 安全验证/风控页面：不要强行拉回登录页，避免打断验证导致刷新循环
+                if self._is_verification_or_risk_url(current):
+                    continue
+
                 # 只对“异常页”做恢复，避免把站点自身的临时跳转链路强行打断造成刷新抖动
                 if (not current) or (current == "about:blank") or current.startswith("chrome-error://") or ("zhipin.com" not in current):
                     now = time.monotonic()
@@ -119,7 +329,7 @@ class BossAutomation:
                         if current == "about:blank" and (self._manual_blank_recover_count % 3 == 0):
                             await self._manual_replace_page_and_goto_login(expected_login_url, reason="guard_repeated_blank")
                         else:
-                            await self.page.goto(expected_login_url, wait_until="domcontentloaded", timeout=60000)
+                            await self._goto_locked(expected_login_url, wait_until="domcontentloaded", timeout=60000)
                     except Exception as e:
                         self._log_step("manual.guard.goto_login.fail", error=str(e), current_url=current)
         except Exception:
@@ -132,7 +342,12 @@ class BossAutomation:
                 return
             self._log_step("manual.replace_page.begin", reason=reason, expected=expected_login_url)
             old = self.page
-            new_page = await self.context.new_page()
+            # 新建 page 也应串行化，避免与外部 evaluate/goto 并发导致状态错乱
+            if self._external_session_lock is None:
+                new_page = await self.context.new_page()
+            else:
+                async with self._external_session_lock:
+                    new_page = await self.context.new_page()
             try:
                 await stealth_async(new_page)
             except Exception:
@@ -168,7 +383,11 @@ class BossAutomation:
 
             self.page = new_page
             try:
-                await new_page.goto(expected_login_url, wait_until="domcontentloaded", timeout=60000)
+                if self._external_session_lock is None:
+                    await new_page.goto(expected_login_url, wait_until="domcontentloaded", timeout=60000)
+                else:
+                    async with self._external_session_lock:
+                        await new_page.goto(expected_login_url, wait_until="domcontentloaded", timeout=60000)
             except Exception as e:
                 self._log_step("manual.replace_page.goto_login.fail", error=str(e))
             self._log_step("manual.replace_page.done", current_url=self.page.url if self.page else None)
@@ -180,6 +399,34 @@ class BossAutomation:
                 pass
         except Exception:
             return
+
+    async def _manual_recover_from_page_closed(self, expected_login_url: str, reason: str) -> None:
+        """手动模式：page 被异常关闭时，创建新 page 并回到登录页。"""
+        try:
+            if not self.manual_mode or not self.context:
+                return
+            target = self._get_manual_recover_target(expected_login_url)
+            self._log_step("manual.page_closed.recover.begin", reason=reason, target=target, last_main_url=self.last_main_url)
+            await self._manual_replace_page_and_goto_login(target, reason=reason)
+            self._log_step("manual.page_closed.recover.done", current_url=self.page.url if self.page else None)
+        except Exception:
+            return
+
+    def _get_manual_recover_target(self, fallback_login_url: str) -> str:
+        """手动模式恢复目标：
+        - 若最近一次主页面 URL 可用且不是登录/验证链路，优先恢复到该页面（避免“掉回扫码”）
+        - 否则回到登录页
+        """
+        last = (self.last_main_url or "").strip()
+        if (
+            last
+            and last != "about:blank"
+            and "zhipin.com" in last
+            and ("web/user/" not in last)  # 登录页
+            and (not self._is_verification_or_risk_url(last))  # 验证/风控链路
+        ):
+            return last
+        return fallback_login_url
 
     async def initialize(self, headless: bool = False, skip_auto_navigate: bool = False) -> bool:
         """
@@ -196,6 +443,11 @@ class BossAutomation:
             logger.info(f"🚀 初始化 Playwright 浏览器... headless={headless}")
             is_manual_mode = bool(skip_auto_navigate)
             self.manual_mode = is_manual_mode
+            manual_minimal = bool(is_manual_mode and os.getenv("MANUAL_MINIMAL", "1").strip() != "0")
+            # 手动模式下守护逻辑（自动拉回登录页）在部分环境会导致“刷新一下就回扫码”的体验。
+            # 默认关闭，仅在需要时手动开启：
+            #   MANUAL_GUARD=1
+            self._manual_guard_enabled = bool(is_manual_mode and os.getenv("MANUAL_GUARD", "").strip() == "1")
             self._prepare_login_failures = 0
             self._step_seq = 0
             logger.info(f"🐍 运行解释器: {sys.executable} | stealth_async_loaded={bool(stealth_async)}")
@@ -203,6 +455,103 @@ class BossAutomation:
 
             # 启动 Playwright
             self.playwright = await async_playwright().start()
+
+            # 手动模式：优先采用“真实 Chrome + CDP 附加”（参考 open_boss_chrome.bat 的稳定性）
+            # 默认开启；如需关闭，设置 MANUAL_CDP_ATTACH=0
+            if is_manual_mode and os.name == "nt" and os.getenv("MANUAL_CDP_ATTACH", "").strip() != "0":
+                login_url = f"{self.base_url}/web/user/?ka=header-login"
+                self._manual_expected_login_url = login_url
+                self._manual_login_started_ts = time.monotonic()
+                self._manual_blank_recover_count = 0
+                self._log_step("initialize.cdp_attach.try", url=login_url)
+                attached = await self._try_attach_to_real_chrome(login_url)
+                if attached:
+                    logger.info("✅ 手动模式已通过 CDP 附加到真实 Chrome")
+                else:
+                    self._log_step("initialize.cdp_attach.fail_or_skip")
+
+            # 手动最小模式：行为尽量贴近 open_boss_no_refresh
+            # - 不注入 stealth / 反检测 / webdriver 改写（会触发风控/异常跳转）
+            # - 不注册大量监听/守护
+            # - 不做自动导航（只保证打开登录页）
+            if manual_minimal and self.page and self.context and self.browser:
+                try:
+                    self.page.set_default_timeout(60000)
+                    self.page.set_default_navigation_timeout(60000)
+                except Exception:
+                    pass
+                # 但仍然需要一个最小“保命”脚本：
+                # - 风控/跳转页有时会调用 window.close() 直接把页签关掉
+                # - 登录后也可能出现反复“同 URL 刷新”（location.reload / history.go(0) / replace(location.href)）
+                # 这里仅拦截 close 和“同 URL 刷新”，不碰 webdriver 等指纹字段，尽量不影响用户手动导航。
+                minimal_guard_js = r"""
+                (() => {
+                  try { window.close = () => {}; } catch(e) {}
+                  try { self.close = () => {}; } catch(e) {}
+
+                  const isSameUrl = (u) => {
+                    try {
+                      if (!u) return true;
+                      const a = new URL(String(u), window.location.href);
+                      const b = new URL(String(window.location.href));
+                      return a.href === b.href;
+                    } catch (e) { return false; }
+                  };
+
+                  try {
+                    const _reload = window.location.reload?.bind(window.location);
+                    if (_reload) window.location.reload = () => {};
+                  } catch(e) {}
+
+                  try {
+                    const _go = window.history.go?.bind(window.history);
+                    if (_go) window.history.go = (delta) => {
+                      try {
+                        if (delta === 0) return;
+                      } catch(e) {}
+                      return _go(delta);
+                    };
+                  } catch(e) {}
+
+                  try {
+                    const _replace = window.location.replace?.bind(window.location);
+                    if (_replace) window.location.replace = (u) => {
+                      try { if (isSameUrl(u)) return; } catch(e) {}
+                      return _replace(u);
+                    };
+                  } catch(e) {}
+
+                  try {
+                    const _assign = window.location.assign?.bind(window.location);
+                    if (_assign) window.location.assign = (u) => {
+                      try { if (isSameUrl(u)) return; } catch(e) {}
+                      return _assign(u);
+                    };
+                  } catch(e) {}
+                })();
+                """
+                try:
+                    # 影响后续导航/新文档
+                    await self.page.add_init_script(minimal_guard_js)
+                except Exception:
+                    pass
+                try:
+                    # 立刻打补丁到“当前已打开的页面”（CDP 复用 tab 时 add_init_script 不一定能立刻生效）
+                    await self.page.evaluate(minimal_guard_js)
+                except Exception:
+                    pass
+                # 如果当前不在登录页，轻量尝试打开登录页（不做任何额外动作）
+                try:
+                    cur = self.page.url or ""
+                except Exception:
+                    cur = ""
+                if "zhipin.com/web/user/" not in cur:
+                    try:
+                        await self.page.goto(f"{self.base_url}/web/user/?ka=header-login", wait_until="domcontentloaded", timeout=60000)
+                    except Exception:
+                        pass
+                self._log_step("initialize.manual_minimal.ready", url=self.page.url if self.page else None)
+                return True
 
             # 启动浏览器
             logger.info(f"🖥️ 启动 Chromium 浏览器，headless={headless}，显示窗口={'否' if headless else '是'}")
@@ -274,8 +623,19 @@ class BossAutomation:
                 self._log_step("initialize.storage_state.empty", auth_file=self.auth_file)
 
             # Windows 手动模式优先使用持久化 profile（更像日常 Chrome）；失败则回退普通启动，避免无窗口
-            self._using_persistent_profile = False
-            if is_manual_mode and os.name == "nt":
+            # 若已通过 CDP 附加到真实 Chrome，则跳过后续 launch/new_context 流程
+            if self.browser is None:
+                self._using_persistent_profile = False
+            # 但持久化 profile 很容易被“用户扩展/企业安全组件/异常配置”污染，出现 chrome-extension://invalid、
+            # 甚至导致主 frame 反复跳 about:blank / page 被关闭。
+            # 因此默认关闭持久化 profile，仅在显式开启时使用：
+            #   MANUAL_USE_PERSISTENT_PROFILE=1
+            use_persistent_profile = (
+                is_manual_mode
+                and os.name == "nt"
+                and os.getenv("MANUAL_USE_PERSISTENT_PROFILE", "").strip() == "1"
+            )
+            if self.browser is None and use_persistent_profile:
                 user_data_dir = os.path.abspath(os.path.join(os.getcwd(), ".boss_chrome_profile"))
                 os.makedirs(user_data_dir, exist_ok=True)
                 logger.info(f"🗂️ 手动模式尝试持久化浏览器目录: {user_data_dir}")
@@ -314,10 +674,15 @@ class BossAutomation:
                     self.context = await self.browser.new_context(**context_options)
                     self.page = await self.context.new_page()
                     await stealth_async(self.page)
-            else:
-                # Windows 上优先用系统 Chrome，通常更“像真人浏览器”，风控更友好
+            elif self.browser is None:
+                # Windows：过去优先用系统 Chrome（channel="chrome"）更像真人浏览器，
+                # 但在部分环境会被企业策略/安全软件注入影响，出现反复 about:blank / ERR_BLOCKED_BY_CLIENT。
+                # 因此手动模式下默认优先使用 Playwright 自带 Chromium（更“干净”），
+                # 只有显式开启时才使用系统 Chrome：
+                #   USE_SYSTEM_CHROME=1
                 try:
-                    if os.name == "nt":
+                    use_system_chrome = (os.name == "nt" and os.getenv("USE_SYSTEM_CHROME", "").strip() == "1")
+                    if use_system_chrome:
                         self.browser = await self.playwright.chromium.launch(channel="chrome", **launch_kwargs)
                     else:
                         self.browser = await self.playwright.chromium.launch(**launch_kwargs)
@@ -333,6 +698,21 @@ class BossAutomation:
             # 关键生命周期日志：定位页面为何变成 about:blank
             def _on_page_close():
                 logger.warning("🧨 Playwright page 已关闭")
+                # 手动模式下：页面被异常关闭会导致前端看到“空白+一直刷新”。
+                # 这里自动拉起一个新 page 回到登录页，尽量让浏览器保持可操作状态。
+                try:
+                    if self.manual_mode and self._manual_expected_login_url and self.context:
+                        # CDP 模式：无论是否开启 guard，只要 page 被关就需要重开一个，否则前端会一直掉线
+                        if self._manual_attached_via_cdp:
+                            asyncio.get_running_loop().create_task(
+                                self._cdp_reopen_page(self._manual_expected_login_url, reason="page_closed")
+                            )
+                        elif self._manual_guard_enabled:
+                            asyncio.get_running_loop().create_task(
+                                self._manual_recover_from_page_closed(self._manual_expected_login_url, reason="page_closed")
+                            )
+                except Exception:
+                    pass
 
             def _on_page_crash():
                 logger.error("💥 Playwright page 崩溃")
@@ -343,6 +723,13 @@ class BossAutomation:
                         logger.info(f"🧭 主页面跳转: {frame.url}")
                         if frame.url and frame.url != "about:blank":
                             self.last_main_url = frame.url
+                        # 如果已经进入招聘端/聊天端等非登录页面，说明用户可能已登录；
+                        # 此时不应再把页面强行拉回登录页，否则会表现为“刷新后回到扫码”。
+                        if self.manual_mode and frame.url and any(p in frame.url for p in ("/web/boss/", "/web/chat/", "/web/geek/", "chat/recommend", "geek/recommend")):
+                            return
+                        # 手动守护未开启时，不做任何自动恢复（交给用户手动处理）
+                        if self.manual_mode and not self._manual_guard_enabled:
+                            return
                         # 手动模式下：被踢到 about:blank / 非登录页，持续守护恢复到期望登录页
                         if (
                             self.manual_mode
@@ -354,6 +741,9 @@ class BossAutomation:
                             )
                             and self._manual_expected_login_url
                         ):
+                            # 若处于安全验证/风控页面，不做拉回，避免刷新循环
+                            if self._is_verification_or_risk_url(frame.url or ""):
+                                return
                             # 节流：避免每次 frame 变更都触发 goto 导致风控/死循环
                             now = time.monotonic()
                             if now - float(self._manual_last_recover_ts or 0.0) < 1.5:
@@ -363,7 +753,7 @@ class BossAutomation:
                             # 只要处于手动模式，就允许持续恢复（时间窗放宽），直到用户扫码完成
                             if 0 < self._manual_login_started_ts and (now - self._manual_login_started_ts) < 1800:
                                 self._manual_blank_recover_count += 1
-                                expected = self._manual_expected_login_url
+                                expected = self._get_manual_recover_target(self._manual_expected_login_url)
                                 self._log_step(
                                     "manual.recover_to_login",
                                     count=self._manual_blank_recover_count,
@@ -379,7 +769,7 @@ class BossAutomation:
                                         )
                                     else:
                                         asyncio.get_running_loop().create_task(
-                                            self.page.goto(expected, wait_until="domcontentloaded", timeout=60000)
+                                            self._goto_locked(expected, wait_until="domcontentloaded", timeout=60000)
                                         )
                                 except Exception:
                                     pass
@@ -494,37 +884,41 @@ class BossAutomation:
             )
 
             if is_manual_mode:
-                # 禁用页面脚本将你从登录页踢走（只要目标不是 /web/user/ 就阻止）
-                await self.page.add_init_script(
-                    """
-                    (() => {
-                      const allow = (u) => {
-                        try {
-                          const s = String(u || '');
-                          return s.includes('/web/user/');
-                        } catch (e) { return false; }
-                      };
-                      try {
-                        // 避免页面脚本强制刷新导致“看起来一直刷新”
-                        const _reload = window.location.reload.bind(window.location);
-                        window.location.reload = () => {};
-                      } catch (e) {}
-                      try {
-                        const loc = window.location;
-                        const _assign = loc.assign.bind(loc);
-                        const _replace = loc.replace.bind(loc);
-                        loc.assign = (u) => { if (!allow(u)) return; return _assign(u); };
-                        loc.replace = (u) => { if (!allow(u)) return; return _replace(u); };
-                      } catch (e) {}
-                      try {
-                        const _push = history.pushState.bind(history);
-                        const _rep = history.replaceState.bind(history);
-                        history.pushState = (st, t, u) => { if (u && !allow(u)) return; return _push(st, t, u); };
-                        history.replaceState = (st, t, u) => { if (u && !allow(u)) return; return _rep(st, t, u); };
-                      } catch (e) {}
-                    })();
-                    """
-                )
+                # 手动模式下“导航强拦截”很容易误伤登录/安全验证链路（例如跳到其它子域、风控页），
+                # 从而表现为页面反复重试/看起来一直刷新。
+                # 因此默认关闭，仅在明确需要时通过环境变量开启：
+                #   MANUAL_BLOCK_NON_LOGIN_NAV=1
+                if os.getenv("MANUAL_BLOCK_NON_LOGIN_NAV", "").strip() == "1":
+                    await self.page.add_init_script(
+                        """
+                        (() => {
+                          const allow = (u) => {
+                            try {
+                              const s = String(u || '');
+                              return s.includes('/web/user/');
+                            } catch (e) { return false; }
+                          };
+                          try {
+                            // 避免页面脚本强制刷新导致“看起来一直刷新”
+                            const _reload = window.location.reload.bind(window.location);
+                            window.location.reload = () => {};
+                          } catch (e) {}
+                          try {
+                            const loc = window.location;
+                            const _assign = loc.assign.bind(loc);
+                            const _replace = loc.replace.bind(loc);
+                            loc.assign = (u) => { if (!allow(u)) return; return _assign(u); };
+                            loc.replace = (u) => { if (!allow(u)) return; return _replace(u); };
+                          } catch (e) {}
+                          try {
+                            const _push = history.pushState.bind(history);
+                            const _rep = history.replaceState.bind(history);
+                            history.pushState = (st, t, u) => { if (u && !allow(u)) return; return _push(st, t, u); };
+                            history.replaceState = (st, t, u) => { if (u && !allow(u)) return; return _rep(st, t, u); };
+                          } catch (e) {}
+                        })();
+                        """
+                    )
 
             # 手动模式优先稳定性，不注入反检测脚本（减少登录页异常跳转风险）
             if not is_manual_mode:
@@ -543,21 +937,16 @@ class BossAutomation:
                 homepage_opened = False
                 last_error: Optional[Exception] = None
 
-                # 期望的登录页 URL 提前就绪：
-                # 如果访问首页过程中瞬间跳到 about:blank，我们希望能够立刻恢复到登录页，
-                # 而不是等到后续 goto_login 那一段代码才设置恢复目标。
-                try:
-                    self._manual_expected_login_url = f"{self.base_url}/web/user/?ka=header-login"
-                    self._manual_login_started_ts = time.monotonic()
-                    self._manual_blank_recover_count = 0
-                    # 启动守护任务：持续确保停在登录页，避免“到登录页后又 blank”
-                    if self._manual_guard_task is None or self._manual_guard_task.done():
-                        self._manual_guard_task = asyncio.create_task(
-                            self._manual_login_guard_loop(self._manual_expected_login_url)
-                        )
-                except Exception:
-                    # 回退：如果这里取不到 event loop，也不影响后续正常流程
-                    pass
+                # 注意：守护任务不要在初始化早期就启动。
+                # 否则它会在页面还处于 about:blank / 首页加载阶段就开始“拉回登录页”，
+                # 反而更容易造成跳转抖动，甚至触发 page 被关闭。
+
+                # 如果已经通过 CDP 附加到真实 Chrome，则“不要再做任何自动导航”。
+                # 否则会像你日志里那样，在 attach 成功后仍然执行 goto_home/goto_login，造成跳转/刷新。
+                if self._manual_attached_via_cdp:
+                    self._log_step("manual.cdp_attached.skip_auto_nav", current_url=self.page.url if self.page else None)
+                    logger.info("✅ CDP 已附加：跳过手动模式自动导航（保持页面稳定）")
+                    return True
 
                 # 用多策略 + 重试尽量确保不是 about:blank
                 for attempt in range(3):
@@ -565,7 +954,7 @@ class BossAutomation:
                         try:
                             self._log_step("manual.goto_home.try", attempt=attempt + 1, wait_until=wait_until)
                             logger.info(f"🌐 访问首页: {self.base_url} (attempt={attempt + 1}/3, wait_until={wait_until})")
-                            await self.page.goto(self.base_url, wait_until=wait_until, timeout=60000)
+                            await self._goto_locked(self.base_url, wait_until=wait_until, timeout=60000)
                             await AntiDetection.random_sleep(0.5, 1.2)
                             if self.page.url and self.page.url != "about:blank":
                                 homepage_opened = True
@@ -595,9 +984,18 @@ class BossAutomation:
                     self._manual_blank_recover_count = 0
                     await self._trace_url_window("before-goto-login", samples=4, interval_s=0.2)
                     await stealth_async(self.page)
-                    await self.page.goto(login_url, wait_until='domcontentloaded', timeout=60000)
+                    await self._goto_locked(login_url, wait_until='domcontentloaded', timeout=60000)
                     # 一旦进入登录页，开启“导航锁定”：禁止被踢回首页/其它页面
                     self._manual_nav_lock_enabled = True
+                    # 进入登录页后，如启用守护再启动（默认不启用，避免“刷新后回扫码”）
+                    if self._manual_guard_enabled:
+                        try:
+                            if self._manual_guard_task is None or self._manual_guard_task.done():
+                                self._manual_guard_task = asyncio.create_task(
+                                    self._manual_login_guard_loop(self._manual_expected_login_url)
+                                )
+                        except Exception:
+                            pass
                     # 默认不阻塞在 Inspector：否则后端接口会卡住，前端看起来“没进展”。
                     # 如需强制暂停（排查/手动操作），设置环境变量 PLAYWRIGHT_PAUSE=1。
                     if os.getenv("PLAYWRIGHT_PAUSE", "").strip() == "1":
@@ -2331,6 +2729,14 @@ class BossAutomation:
         logger.info("🔚 清理资源...")
 
         try:
+            # CDP 附加到“真实 Chrome”时：只断开引用，不要关闭真实浏览器。
+            # 否则前端看起来像“浏览器自己关了”（实际是后端 cleanup 把会话关掉）。
+            if self._manual_attached_via_cdp:
+                self.page = None
+                self.context = None
+                self.browser = None
+                return
+
             # launch_persistent_context：只关 context 即可，避免先关 page 再关 browser 导致异常/锁残留
             if self._using_persistent_profile and self.context:
                 await self.context.close()

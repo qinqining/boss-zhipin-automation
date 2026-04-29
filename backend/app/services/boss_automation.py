@@ -5,9 +5,23 @@ Boss 直聘自动化核心服务
 import os
 import asyncio
 import logging
+import sys
+import time
 from typing import Optional, Dict, List
 from datetime import datetime
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
+
+# playwright-stealth 版本在不同发行版本/命名空间里可能不提供 stealth_async。
+# 这里做兼容封装：如果没有 stealth_async 就退化到 Stealth().use_async(page)。
+try:
+    from playwright_stealth import stealth_async  # type: ignore
+except ImportError:  # pragma: no cover
+    from playwright_stealth import Stealth  # type: ignore
+
+    async def stealth_async(page: Page) -> None:
+        # playwright-stealth v2.x: use_async() 返回 context manager，
+        # 不能 await(page)；对 Page 应用脚本使用 apply_stealth_async(page)。
+        await Stealth().apply_stealth_async(page)
 
 from app.services.anti_detection import AntiDetection
 
@@ -26,11 +40,146 @@ class BossAutomation:
         self.page: Optional[Page] = None
         self.is_logged_in: bool = False
         self.current_com_id: Optional[int] = com_id
+        self.last_main_url: Optional[str] = None
+        # Windows 手动模式是否使用 launch_persistent_context（清理方式不同）
+        self._using_persistent_profile: bool = False
+        self.manual_mode: bool = False
+        self._prepare_login_failures: int = 0
+        self._max_prepare_login_failures: int = 3
+        self._step_seq: int = 0
+        # 手动模式 about:blank 恢复
+        self._manual_expected_login_url: Optional[str] = None
+        self._manual_blank_recover_count: int = 0
+        # 不再用固定上限硬停：改为节流式持续恢复（避免反复 blank 时“恢复次数用完”后彻底失控）
+        self._manual_blank_recover_max: int = 3
+        # 使用单调时钟，避免与 time.time() 混用导致恢复条件失效
+        self._manual_login_started_ts: float = 0.0
+        self._manual_last_recover_ts: float = 0.0
+        self._manual_guard_task: Optional[asyncio.Task] = None
+        self._manual_nav_lock_enabled: bool = False
 
         # 配置项
         self.base_url = "https://www.zhipin.com"
         # 如果指定了com_id，使用对应的auth文件；否则不加载任何认证文件（空cookies）
         self.auth_file = self.get_auth_file_path(com_id) if com_id else None
+
+    def _log_step(self, tag: str, **kwargs):
+        """统一步骤日志，便于定位流程卡点与跳转原因。"""
+        self._step_seq += 1
+        extras = ", ".join(f"{k}={v}" for k, v in kwargs.items())
+        if extras:
+            logger.info(f"🔎 STEP[{self._step_seq:03d}] {tag} | {extras}")
+        else:
+            logger.info(f"🔎 STEP[{self._step_seq:03d}] {tag}")
+
+    async def _trace_url_window(self, label: str, samples: int = 10, interval_s: float = 0.3):
+        """短时间高频采样当前 URL，抓“瞬间跳转到 blank”窗口。"""
+        for i in range(samples):
+            try:
+                url = self.page.url if self.page else None
+                self._log_step("trace.url", label=label, idx=i + 1, url=url)
+            except Exception as e:
+                self._log_step("trace.url.error", label=label, idx=i + 1, error=str(e))
+            await asyncio.sleep(interval_s)
+
+    async def _apply_stealth(self, page: Optional[Page]):
+        """创建/切换 page 后立即应用 stealth。"""
+        if page:
+            await stealth_async(page)
+
+    async def _manual_login_guard_loop(self, expected_login_url: str) -> None:
+        """手动模式守护：只要离开登录页/变 blank，就持续（节流）拉回登录页。"""
+        try:
+            # 守护 30 分钟，足够扫码/验证；超时后自动退出，避免长期占用资源
+            started = time.monotonic()
+            while time.monotonic() - started < 1800:
+                await asyncio.sleep(1.0)
+                if not self.manual_mode or not self.page:
+                    return
+                try:
+                    current = self.page.url or ""
+                except Exception:
+                    current = ""
+
+                # 只对“异常页”做恢复，避免把站点自身的临时跳转链路强行打断造成刷新抖动
+                if (not current) or (current == "about:blank") or current.startswith("chrome-error://") or ("zhipin.com" not in current):
+                    now = time.monotonic()
+                    # 节流：避免疯狂重试触发风控
+                    if now - float(self._manual_last_recover_ts or 0.0) < 2.0:
+                        continue
+                    self._manual_last_recover_ts = now
+                    self._manual_blank_recover_count += 1
+                    self._log_step(
+                        "manual.guard.recover_to_login",
+                        count=self._manual_blank_recover_count,
+                        expected=expected_login_url,
+                        current_url=current,
+                    )
+                    try:
+                        if current == "about:blank" and (self._manual_blank_recover_count % 3 == 0):
+                            await self._manual_replace_page_and_goto_login(expected_login_url, reason="guard_repeated_blank")
+                        else:
+                            await self.page.goto(expected_login_url, wait_until="domcontentloaded", timeout=60000)
+                    except Exception as e:
+                        self._log_step("manual.guard.goto_login.fail", error=str(e), current_url=current)
+        except Exception:
+            return
+
+    async def _manual_replace_page_and_goto_login(self, expected_login_url: str, reason: str) -> None:
+        """手动模式：当前 page 反复 blank 时，直接换新 page 再进登录页。"""
+        try:
+            if not self.context:
+                return
+            self._log_step("manual.replace_page.begin", reason=reason, expected=expected_login_url)
+            old = self.page
+            new_page = await self.context.new_page()
+            try:
+                await stealth_async(new_page)
+            except Exception:
+                pass
+            # 基础防护脚本（不依赖旧 page 的监听器）
+            try:
+                await new_page.add_init_script(
+                    """
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    window.close = () => {};
+                    self.close = () => {};
+                    try { window.location.reload = () => {}; } catch(e) {}
+                    """
+                )
+                await new_page.add_init_script(
+                    """
+                    (() => {
+                      const allow = (u) => {
+                        try { return String(u || '').includes('/web/user/'); } catch(e) { return false; }
+                      };
+                      try {
+                        const loc = window.location;
+                        const _assign = loc.assign.bind(loc);
+                        const _replace = loc.replace.bind(loc);
+                        loc.assign = (u) => { if (!allow(u)) return; return _assign(u); };
+                        loc.replace = (u) => { if (!allow(u)) return; return _replace(u); };
+                      } catch (e) {}
+                    })();
+                    """
+                )
+            except Exception:
+                pass
+
+            self.page = new_page
+            try:
+                await new_page.goto(expected_login_url, wait_until="domcontentloaded", timeout=60000)
+            except Exception as e:
+                self._log_step("manual.replace_page.goto_login.fail", error=str(e))
+            self._log_step("manual.replace_page.done", current_url=self.page.url if self.page else None)
+
+            try:
+                if old:
+                    await old.close()
+            except Exception:
+                pass
+        except Exception:
+            return
 
     async def initialize(self, headless: bool = False, skip_auto_navigate: bool = False) -> bool:
         """
@@ -45,70 +194,421 @@ class BossAutomation:
         """
         try:
             logger.info(f"🚀 初始化 Playwright 浏览器... headless={headless}")
+            is_manual_mode = bool(skip_auto_navigate)
+            self.manual_mode = is_manual_mode
+            self._prepare_login_failures = 0
+            self._step_seq = 0
+            logger.info(f"🐍 运行解释器: {sys.executable} | stealth_async_loaded={bool(stealth_async)}")
+            self._log_step("initialize.begin", headless=headless, manual_mode=is_manual_mode, com_id=self.current_com_id)
 
             # 启动 Playwright
             self.playwright = await async_playwright().start()
 
             # 启动浏览器
             logger.info(f"🖥️ 启动 Chromium 浏览器，headless={headless}，显示窗口={'否' if headless else '是'}")
-            self.browser = await self.playwright.chromium.launch(
-                headless=headless,
-                args=[
+            # 手动模式：尽量接近「用户自己点的 Chrome」，不要带 --no-sandbox（会触发黄条且易被风控）
+            if is_manual_mode:
+                launch_args = [
+                    '--disable-blink-features=AutomationControlled',
+                    '--start-maximized',
+                    '--no-first-run',
+                    '--no-default-browser-check',
+                    '--disable-popup-blocking',
+                    # 手动模式用持久化 profile 时，系统/用户安装的扩展可能引发 chrome-extension://invalid
+                    # 甚至触发异常跳转；这里显式禁用扩展，优先保证扫码登录页稳定。
+                    '--disable-extensions',
+                    '--disable-component-extensions-with-background-pages',
+                ]
+            else:
+                launch_args = [
                     '--disable-blink-features=AutomationControlled',
                     '--no-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-infobars',
-                    '--start-maximized',  # 启动时最大化
+                    '--start-maximized',
                     '--no-first-run',
                     '--no-default-browser-check',
                     '--disable-popup-blocking',
                     '--disable-features=TranslateUI',
                 ]
-            )
 
-            # 创建浏览器上下文
-            # 不设置固定 viewport，让浏览器窗口自适应
+            launch_kwargs = dict(
+                headless=headless,
+                args=launch_args,
+            )
+            if is_manual_mode:
+                # 手动模式：去掉自动化标记；Playwright 默认仍可能带 --no-sandbox（Chrome 黄条）
+                launch_kwargs["ignore_default_args"] = [
+                    "--enable-automation",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                ]
+
+            # 创建浏览器上下文参数
             context_options = {
                 'viewport': None,  # 不限制 viewport，跟随窗口大小
-                'user_agent': AntiDetection.get_random_user_agent(),
                 'locale': 'zh-CN',
                 'timezone_id': 'Asia/Shanghai',
-                'geolocation': {'latitude': 39.9042, 'longitude': 116.4074},  # 北京
-                'permissions': ['geolocation'],
                 'color_scheme': 'light',
                 'device_scale_factor': 1,
                 'is_mobile': False,
                 'has_touch': False,
                 'java_script_enabled': True,
-                'bypass_csp': True,
                 'ignore_https_errors': True,
+                'user_agent': AntiDetection.get_random_user_agent(),
             }
+            if not is_manual_mode:
+                context_options.update({
+                    'geolocation': {'latitude': 39.9042, 'longitude': 116.4074},
+                    'permissions': ['geolocation'],
+                    'bypass_csp': True,
+                })
 
             # 如果指定了auth_file且文件存在，则加载已保存的登录状态
             if self.auth_file and os.path.exists(self.auth_file):
                 logger.info(f"📂 加载已保存的登录状态: {self.auth_file}")
                 context_options['storage_state'] = self.auth_file
+                self._log_step("initialize.storage_state.loaded", auth_file=self.auth_file)
             else:
                 logger.info("🆕 使用空白状态初始化浏览器（无登录信息）")
+                self._log_step("initialize.storage_state.empty", auth_file=self.auth_file)
 
-            self.context = await self.browser.new_context(**context_options)
+            # Windows 手动模式优先使用持久化 profile（更像日常 Chrome）；失败则回退普通启动，避免无窗口
+            self._using_persistent_profile = False
+            if is_manual_mode and os.name == "nt":
+                user_data_dir = os.path.abspath(os.path.join(os.getcwd(), ".boss_chrome_profile"))
+                os.makedirs(user_data_dir, exist_ok=True)
+                logger.info(f"🗂️ 手动模式尝试持久化浏览器目录: {user_data_dir}")
+                self._log_step("initialize.persistent_context.try", user_data_dir=user_data_dir)
+                try:
+                    persistent_kwargs = dict(launch_kwargs)
+                    persistent_kwargs.pop("headless", None)
+                    persistent_kwargs["headless"] = False
+                    persistent_kwargs.update(context_options)
+                    persistent_kwargs["channel"] = "chrome"
 
-            # 创建新页面
-            self.page = await self.context.new_page()
+                    self.context = await self.playwright.chromium.launch_persistent_context(
+                        user_data_dir=user_data_dir,
+                        **persistent_kwargs
+                    )
+                    self.browser = self.context.browser
+                    self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+                    await stealth_async(self.page)
+                    self._using_persistent_profile = True
+                    logger.info("✅ 持久化 Chrome 上下文已启动")
+                    self._log_step("initialize.persistent_context.ok", page_url=self.page.url if self.page else None)
+                except Exception as e:
+                    logger.warning(f"⚠️ 持久化启动失败，回退普通启动: {str(e)}", exc_info=True)
+                    self._log_step("initialize.persistent_context.fail", error=str(e))
+                    self._using_persistent_profile = False
+                    self.context = None
+                    self.browser = None
+                    self.page = None
+                    try:
+                        if os.name == "nt":
+                            self.browser = await self.playwright.chromium.launch(channel="chrome", **launch_kwargs)
+                        else:
+                            self.browser = await self.playwright.chromium.launch(**launch_kwargs)
+                    except Exception:
+                        self.browser = await self.playwright.chromium.launch(**launch_kwargs)
+                    self.context = await self.browser.new_context(**context_options)
+                    self.page = await self.context.new_page()
+                    await stealth_async(self.page)
+            else:
+                # Windows 上优先用系统 Chrome，通常更“像真人浏览器”，风控更友好
+                try:
+                    if os.name == "nt":
+                        self.browser = await self.playwright.chromium.launch(channel="chrome", **launch_kwargs)
+                    else:
+                        self.browser = await self.playwright.chromium.launch(**launch_kwargs)
+                except Exception:
+                    # 回退到 Playwright 自带 Chromium
+                    self.browser = await self.playwright.chromium.launch(**launch_kwargs)
 
-            # 注入反检测脚本
-            await AntiDetection.inject_anti_detection_script(self.page)
+                self.context = await self.browser.new_context(**context_options)
+                # 创建新页面
+                self.page = await self.context.new_page()
+                await stealth_async(self.page)
+
+            # 关键生命周期日志：定位页面为何变成 about:blank
+            def _on_page_close():
+                logger.warning("🧨 Playwright page 已关闭")
+
+            def _on_page_crash():
+                logger.error("💥 Playwright page 崩溃")
+
+            def _on_frame_navigated(frame):
+                try:
+                    if self.page and frame == self.page.main_frame:
+                        logger.info(f"🧭 主页面跳转: {frame.url}")
+                        if frame.url and frame.url != "about:blank":
+                            self.last_main_url = frame.url
+                        # 手动模式下：被踢到 about:blank / 非登录页，持续守护恢复到期望登录页
+                        if (
+                            self.manual_mode
+                            # 只在真正“异常页”时恢复，避免打断站点自身的临时跳转链路造成刷新抖动
+                            and (
+                                frame.url == "about:blank"
+                                or (frame.url and frame.url.startswith("chrome-error://"))
+                                or (frame.url and "zhipin.com" not in frame.url)
+                            )
+                            and self._manual_expected_login_url
+                        ):
+                            # 节流：避免每次 frame 变更都触发 goto 导致风控/死循环
+                            now = time.monotonic()
+                            if now - float(self._manual_last_recover_ts or 0.0) < 1.5:
+                                return
+                            self._manual_last_recover_ts = now
+
+                            # 只要处于手动模式，就允许持续恢复（时间窗放宽），直到用户扫码完成
+                            if 0 < self._manual_login_started_ts and (now - self._manual_login_started_ts) < 1800:
+                                self._manual_blank_recover_count += 1
+                                expected = self._manual_expected_login_url
+                                self._log_step(
+                                    "manual.recover_to_login",
+                                    count=self._manual_blank_recover_count,
+                                    expected=expected,
+                                    from_url=frame.url,
+                                    last_main_url=self.last_main_url,
+                                )
+                                try:
+                                    # 连续 blank 说明当前 tab 可能被污染，换新 tab 更稳
+                                    if frame.url == "about:blank" and (self._manual_blank_recover_count % 3 == 0):
+                                        asyncio.get_running_loop().create_task(
+                                            self._manual_replace_page_and_goto_login(expected, reason="repeated_blank")
+                                        )
+                                    else:
+                                        asyncio.get_running_loop().create_task(
+                                            self.page.goto(expected, wait_until="domcontentloaded", timeout=60000)
+                                        )
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
+            def _on_request_failed(request):
+                try:
+                    # 只记录 Boss 相关失败请求，避免日志过载
+                    if "zhipin.com" in request.url:
+                        failure = request.failure
+                        err_text = failure.get("errorText") if isinstance(failure, dict) else str(failure)
+                        is_main_doc = request.is_navigation_request()
+                        logger.warning(
+                            f"🌐 请求失败: {request.method} {request.url} -> {err_text} | main_doc={is_main_doc}"
+                        )
+                except Exception:
+                    pass
+
+            def _on_response(response):
+                try:
+                    url = response.url or ""
+                    if "zhipin.com" not in url:
+                        return
+                    status = response.status
+                    req = response.request
+                    is_main_doc = (req.resource_type == "document") or req.is_navigation_request()
+                    if req.resource_type == "document":
+                        logger.info(
+                            f"📄 文档响应: {status} {req.method} {url} | from={req.headers.get('referer', '')}"
+                        )
+                    if status in (301, 302, 303, 307, 308):
+                        location = response.headers.get("location", "")
+                        logger.warning(f"↪️ 重定向响应: {status} {url} -> {location} | main_doc={is_main_doc}")
+                        if is_main_doc and status == 302:
+                            logger.warning(f"🧾 302响应头(main_doc): {dict(response.headers)}")
+                    elif status >= 400:
+                        logger.warning(f"🚨 异常响应: {status} {response.request.method} {url}")
+                except Exception:
+                    pass
+
+            def _on_console(message):
+                try:
+                    msg_type = (message.type or "").lower()
+                    text = (message.text or "").strip()
+                    location = getattr(message, "location", None)
+                    loc_text = ""
+                    if isinstance(location, dict):
+                        loc_text = f" @ {location.get('url', '')}:{location.get('lineNumber', '')}:{location.get('columnNumber', '')}"
+                    if msg_type == "error":
+                        logger.error(f"🧪 控制台error: {text[:1000]}{loc_text}")
+                    elif msg_type == "warning":
+                        logger.warning(f"🧪 控制台warning: {text[:500]}{loc_text}")
+                except Exception:
+                    pass
+
+            def _on_page_error(error):
+                try:
+                    logger.error(f"💣 页面脚本异常: {error}")
+                except Exception:
+                    pass
+
+            self.page.on("close", lambda: _on_page_close())
+            self.page.on("crash", lambda: _on_page_crash())
+            self.page.on("framenavigated", _on_frame_navigated)
+            self.page.on("requestfailed", _on_request_failed)
+            self.page.on("response", _on_response)
+            self.page.on("console", _on_console)
+            self.page.on("pageerror", _on_page_error)
+
+            # 手动模式：可选的“文档级跳转拦截”。
+            # 默认关闭（MANUAL_LOCK_NAV!=1），因为硬拦截可能导致 net::ERR_FAILED/ERR_ABORTED，
+            # 进而表现为“拉回了又一直刷新/抖动”。
+            if is_manual_mode and self.context and os.getenv("MANUAL_LOCK_NAV", "").strip() == "1":
+                expected_login_prefix = f"{self.base_url}/web/user/"
+
+                async def _route_lock_login(route, request):
+                    try:
+                        if not self.manual_mode:
+                            return await route.continue_()
+                        # 仅当“登录页已打开”后才启用锁定，避免初始化阶段访问首页被误伤
+                        if not getattr(self, "_manual_nav_lock_enabled", False):
+                            return await route.continue_()
+                        if request.resource_type != "document" and not request.is_navigation_request():
+                            return await route.continue_()
+                        url = request.url or ""
+                        # 允许登录页及其子路由；其余文档跳转一律拦截
+                        if url.startswith(expected_login_prefix):
+                            return await route.continue_()
+                        # 少数情况下 about:blank 或 chrome-error 会触发导航；直接拦截后由 guard 拉回
+                        self._log_step("manual.route.block_nav", url=url)
+                        return await route.abort()
+                    except Exception:
+                        try:
+                            return await route.continue_()
+                        except Exception:
+                            return
+
+                try:
+                    await self.context.route("**/*", _route_lock_login)
+                except Exception:
+                    pass
+
+            # 显式隐藏 webdriver 指纹
+            await self.page.add_init_script(
+                """
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                // 防止页面脚本调用 window.close / self.close 导致窗口瞬间消失（进而表现为 about:blank）
+                window.close = () => {};
+                self.close = () => {};
+                """
+            )
+
+            if is_manual_mode:
+                # 禁用页面脚本将你从登录页踢走（只要目标不是 /web/user/ 就阻止）
+                await self.page.add_init_script(
+                    """
+                    (() => {
+                      const allow = (u) => {
+                        try {
+                          const s = String(u || '');
+                          return s.includes('/web/user/');
+                        } catch (e) { return false; }
+                      };
+                      try {
+                        // 避免页面脚本强制刷新导致“看起来一直刷新”
+                        const _reload = window.location.reload.bind(window.location);
+                        window.location.reload = () => {};
+                      } catch (e) {}
+                      try {
+                        const loc = window.location;
+                        const _assign = loc.assign.bind(loc);
+                        const _replace = loc.replace.bind(loc);
+                        loc.assign = (u) => { if (!allow(u)) return; return _assign(u); };
+                        loc.replace = (u) => { if (!allow(u)) return; return _replace(u); };
+                      } catch (e) {}
+                      try {
+                        const _push = history.pushState.bind(history);
+                        const _rep = history.replaceState.bind(history);
+                        history.pushState = (st, t, u) => { if (u && !allow(u)) return; return _push(st, t, u); };
+                        history.replaceState = (st, t, u) => { if (u && !allow(u)) return; return _rep(st, t, u); };
+                      } catch (e) {}
+                    })();
+                    """
+                )
+
+            # 手动模式优先稳定性，不注入反检测脚本（减少登录页异常跳转风险）
+            if not is_manual_mode:
+                await AntiDetection.inject_anti_detection_script(self.page)
+
+            # 统一超时配置，避免首页导航失败后停留在 about:blank
+            self.page.set_default_timeout(60000)
+            self.page.set_default_navigation_timeout(60000)
 
             logger.info("✅ 浏览器初始化成功")
+            self._log_step("initialize.ready", page_url=self.page.url if self.page else None)
 
             if skip_auto_navigate:
                 # 手动模式：先访问首页
                 logger.info("📌 手动模式：启动浏览器")
+                homepage_opened = False
+                last_error: Optional[Exception] = None
+
+                # 期望的登录页 URL 提前就绪：
+                # 如果访问首页过程中瞬间跳到 about:blank，我们希望能够立刻恢复到登录页，
+                # 而不是等到后续 goto_login 那一段代码才设置恢复目标。
                 try:
-                    await self.page.goto(self.base_url, wait_until='domcontentloaded', timeout=20000)
-                    logger.info("✅ 已打开 Boss 直聘首页")
+                    self._manual_expected_login_url = f"{self.base_url}/web/user/?ka=header-login"
+                    self._manual_login_started_ts = time.monotonic()
+                    self._manual_blank_recover_count = 0
+                    # 启动守护任务：持续确保停在登录页，避免“到登录页后又 blank”
+                    if self._manual_guard_task is None or self._manual_guard_task.done():
+                        self._manual_guard_task = asyncio.create_task(
+                            self._manual_login_guard_loop(self._manual_expected_login_url)
+                        )
+                except Exception:
+                    # 回退：如果这里取不到 event loop，也不影响后续正常流程
+                    pass
+
+                # 用多策略 + 重试尽量确保不是 about:blank
+                for attempt in range(3):
+                    for wait_until in ("domcontentloaded", "load", "networkidle"):
+                        try:
+                            self._log_step("manual.goto_home.try", attempt=attempt + 1, wait_until=wait_until)
+                            logger.info(f"🌐 访问首页: {self.base_url} (attempt={attempt + 1}/3, wait_until={wait_until})")
+                            await self.page.goto(self.base_url, wait_until=wait_until, timeout=60000)
+                            await AntiDetection.random_sleep(0.5, 1.2)
+                            if self.page.url and self.page.url != "about:blank":
+                                homepage_opened = True
+                                self._log_step("manual.goto_home.ok", url=self.page.url)
+                                break
+                        except Exception as e:
+                            last_error = e
+                            self._log_step("manual.goto_home.fail", attempt=attempt + 1, wait_until=wait_until, error=str(e))
+                    if homepage_opened:
+                        break
+
+                if homepage_opened:
+                    logger.info(f"✅ 已打开 Boss 直聘首页: {self.page.url}")
+                else:
+                    logger.warning(f"⚠️ 访问首页失败，当前仍为: {self.page.url}")
+                    if last_error:
+                        logger.warning(f"⚠️ 最后一次错误: {str(last_error)}")
+                    # 手动模式：首页失败不致命，继续尝试直达登录页（很多时候首页会被风控/网络影响）
+
+                # 直接打开登录页，减少首页点击“登录”触发异常跳转的概率
+                try:
+                    login_url = f"{self.base_url}/web/user/?ka=header-login"
+                    self._log_step("manual.goto_login.try", login_url=login_url)
+                    logger.info(f"🔐 手动模式：直达登录页 {login_url}")
+                    self._manual_expected_login_url = login_url
+                    self._manual_login_started_ts = time.monotonic()
+                    self._manual_blank_recover_count = 0
+                    await self._trace_url_window("before-goto-login", samples=4, interval_s=0.2)
+                    await stealth_async(self.page)
+                    await self.page.goto(login_url, wait_until='domcontentloaded', timeout=60000)
+                    # 一旦进入登录页，开启“导航锁定”：禁止被踢回首页/其它页面
+                    self._manual_nav_lock_enabled = True
+                    # 默认不阻塞在 Inspector：否则后端接口会卡住，前端看起来“没进展”。
+                    # 如需强制暂停（排查/手动操作），设置环境变量 PLAYWRIGHT_PAUSE=1。
+                    if os.getenv("PLAYWRIGHT_PAUSE", "").strip() == "1":
+                        await self.page.pause()
+                    await self._trace_url_window("after-goto-login", samples=12, interval_s=0.25)
+                    await AntiDetection.random_sleep(0.5, 1.2)
+                    logger.info(f"✅ 当前页面 URL: {self.page.url}")
+                    self._log_step("manual.goto_login.done", current_url=self.page.url)
                 except Exception as e:
-                    logger.warning(f"⚠️ 访问首页失败: {str(e)}")
+                    logger.warning(f"⚠️ 直达登录页失败，保持当前页: {str(e)}")
+                    self._log_step("manual.goto_login.fail", error=str(e), current_url=self.page.url if self.page else None)
 
                 # 如果加载了 cookies，验证是否有效，有效则直接导航到推荐牛人页面
                 if self.auth_file and os.path.exists(self.auth_file):
@@ -162,20 +662,59 @@ class BossAutomation:
         """
         try:
             logger.info("🔍 准备登录页面...")
+            self._log_step("prepare_login.begin", failures=self._prepare_login_failures, manual_mode=self.manual_mode)
+            if self._prepare_login_failures >= self._max_prepare_login_failures:
+                msg = f"连续失败 {self._prepare_login_failures} 次，已暂停自动跳转，请手动打开登录页后重试"
+                logger.error(f"❌ {msg}")
+                self._log_step("prepare_login.stop_by_retry", message=msg)
+                return {
+                    'success': False,
+                    'already_logged_in': False,
+                    'message': msg
+                }
 
             # 获取当前URL
             current_url = self.page.url
             logger.info(f"📍 当前页面（准备前）: {current_url}")
+            self._log_step("prepare_login.current_url", current_url=current_url)
+            if self.manual_mode and (not current_url or current_url == 'about:blank'):
+                self._prepare_login_failures += 1
+                msg = "手动模式下检测到空白页，已停止自动跳转，请手动输入 https://www.zhipin.com/web/user/?ka=header-login"
+                logger.warning(f"⚠️ {msg}")
+                self._log_step("prepare_login.manual_blank_blocked", failures=self._prepare_login_failures)
+                return {
+                    'success': False,
+                    'already_logged_in': False,
+                    'message': msg
+                }
+            # 手动模式若已在登录页，不再做任何自动导航，直接停在原地给用户扫码
+            if self.manual_mode and 'zhipin.com/web/user/' in current_url:
+                logger.info("✋ 手动模式已在登录页，锁定当前页，不再自动跳转")
+                qrcode_switch_selector = '#wrap > div > div.login-entry-page > div.login-register-content > div.btn-sign-switch.ewm-switch'
+                try:
+                    await self.page.wait_for_selector(qrcode_switch_selector, timeout=5000)
+                    await self.page.click(qrcode_switch_selector)
+                except Exception as e:
+                    logger.warning(f"⚠️ 手动模式未找到二维码切换按钮，额外等待30秒供手动操作: {str(e)}")
+                    await asyncio.sleep(30)
+                return {
+                    'success': True,
+                    'already_logged_in': False,
+                    'message': '手动模式已锁定登录页，请直接扫码'
+                }
 
             # 访问首页（带重试逻辑）
             max_retries = 3
             for attempt in range(max_retries):
                 try:
+                    self._log_step("prepare_login.goto_home.try", attempt=attempt + 1)
                     logger.info(f"🌐 尝试访问首页 (尝试 {attempt + 1}/{max_retries})...")
                     await self.page.goto(self.base_url, wait_until='domcontentloaded', timeout=20000)
                     logger.info(f"✅ 首页加载成功")
+                    self._log_step("prepare_login.goto_home.ok", url=self.page.url)
                     break
                 except Exception as e:
+                    self._log_step("prepare_login.goto_home.fail", attempt=attempt + 1, error=str(e))
                     if attempt == max_retries - 1:
                         logger.error(f"❌ 访问首页失败（已尝试 {max_retries} 次）: {str(e)}")
                         raise
@@ -191,6 +730,7 @@ class BossAutomation:
             if login_button:
                 # 未登录，点击登录按钮
                 logger.info("👆 点击登录按钮...")
+                self._log_step("prepare_login.click_login.try")
                 await login_button.click()
                 await self.page.wait_for_load_state('networkidle')
                 await AntiDetection.random_sleep(1, 2)
@@ -198,6 +738,7 @@ class BossAutomation:
                 # 检查是否跳转到登录页面
                 current_url = self.page.url
                 logger.info(f"📍 当前页面: {current_url}")
+                self._log_step("prepare_login.after_click", current_url=current_url)
 
                 # 如果跳转到了已登录页面
                 if '/web/chat/' in current_url or '/web/boss/' in current_url:
@@ -216,8 +757,10 @@ class BossAutomation:
                         if response.get('code') == 0:
                             # 登录成功
                             self.is_logged_in = True
-                            await self.context.storage_state(path=self.auth_file)
+                            if self.auth_file:
+                                await self.context.storage_state(path=self.auth_file)
                             logger.info("✅ 已登录状态验证成功")
+                            self._prepare_login_failures = 0
 
                             # 导航到推荐页面
                             await self.navigate_to_recommend_page()
@@ -236,12 +779,17 @@ class BossAutomation:
                     qrcode_switch_selector = '#wrap > div > div.login-entry-page > div.login-register-content > div.btn-sign-switch.ewm-switch'
                     try:
                         logger.info("🔄 切换到二维码登录模式...")
+                        self._log_step("prepare_login.switch_qrcode.try")
                         await self.page.wait_for_selector(qrcode_switch_selector, timeout=5000)
                         await self.page.click(qrcode_switch_selector)
                         await AntiDetection.random_sleep(1, 2)
                         logger.info("✅ 已切换到二维码登录模式")
+                        self._log_step("prepare_login.switch_qrcode.ok")
                     except Exception as e:
                         logger.warning(f"⚠️ 切换二维码登录失败（可能已经是二维码模式）: {str(e)}")
+                        self._log_step("prepare_login.switch_qrcode.fail", error=str(e))
+                        logger.info("⏳ 额外等待30秒，便于手动点击“二维码登录”")
+                        await asyncio.sleep(30)
 
                     # 等待二维码加载
                     qrcode_img_selector = '#wrap > div > div.login-entry-page > div.login-register-content > div.scan-app-wrapper > div.qr-code-box > div.qr-img-box > img'
@@ -250,6 +798,7 @@ class BossAutomation:
                         await self.page.wait_for_selector(qrcode_img_selector, timeout=10000)
                         await AntiDetection.random_sleep(0.5, 1)
                         logger.info("✅ 二维码已加载到页面")
+                        self._log_step("prepare_login.qrcode.ready")
 
                         return {
                             'success': True,
@@ -264,6 +813,8 @@ class BossAutomation:
                         }
                 else:
                     logger.warning(f"⚠️ 未跳转到预期的页面: {current_url}")
+                    self._prepare_login_failures += 1
+                    self._log_step("prepare_login.unexpected_url", current_url=current_url, failures=self._prepare_login_failures)
                     return {
                         'success': False,
                         'message': '未跳转到登录页面'
@@ -285,7 +836,9 @@ class BossAutomation:
                         # 确实已登录
                         logger.info("✅ 验证通过，用户已登录")
                         self.is_logged_in = True
-                        await self.context.storage_state(path=self.auth_file)
+                        if self.auth_file:
+                            await self.context.storage_state(path=self.auth_file)
+                        self._prepare_login_failures = 0
 
                         # 导航到推荐页面
                         await self.navigate_to_recommend_page()
@@ -296,12 +849,21 @@ class BossAutomation:
                             'message': '已登录'
                         }
                     else:
-                        # 登录已失效，导航到登录页面
+                        # 手动模式下不要强制跳转，避免快速刷新/回 blank
+                        if self.manual_mode:
+                            logger.warning("⚠️ 登录已失效（手动模式），保持当前页面不自动跳转")
+                            return {
+                                'success': False,
+                                'already_logged_in': False,
+                                'message': '登录状态失效，请手动在当前页面完成登录'
+                            }
+
+                        # 非手动模式才执行自动跳转
                         logger.warning("⚠️ 登录已失效，导航到登录页面...")
                         self.is_logged_in = False
 
-                        # 清除过期状态
-                        if os.path.exists(self.auth_file):
+                        # 清除过期状态（auth_file 可能为空，需先判空）
+                        if self.auth_file and os.path.exists(self.auth_file):
                             os.remove(self.auth_file)
                         await self.context.clear_cookies()
 
@@ -310,7 +872,9 @@ class BossAutomation:
                         for attempt in range(3):
                             try:
                                 logger.info(f"🌐 尝试访问登录页面 (尝试 {attempt + 1}/3)...")
+                                await stealth_async(self.page)
                                 await self.page.goto(login_url, wait_until='domcontentloaded', timeout=20000)
+                                await self.page.pause()
                                 logger.info(f"✅ 登录页面加载成功")
                                 break
                             except Exception as e:
@@ -332,6 +896,8 @@ class BossAutomation:
                             logger.info("✅ 已切换到二维码登录模式")
                         except Exception as e:
                             logger.warning(f"⚠️ 切换二维码登录失败: {str(e)}")
+                            logger.info("⏳ 额外等待30秒，便于手动点击“二维码登录”")
+                            await asyncio.sleep(30)
 
                         # 等待二维码加载
                         qrcode_img_selector = '#wrap > div > div.login-entry-page > div.login-register-content > div.scan-app-wrapper > div.qr-code-box > div.qr-img-box > img'
@@ -347,6 +913,8 @@ class BossAutomation:
 
                 except Exception as e:
                     logger.error(f"❌ 验证登录状态失败: {str(e)}")
+                    self._prepare_login_failures += 1
+                    self._log_step("prepare_login.verify_failed", error=str(e), failures=self._prepare_login_failures)
                     return {
                         'success': False,
                         'message': f'验证登录失败: {str(e)}'
@@ -354,6 +922,8 @@ class BossAutomation:
 
         except Exception as e:
             logger.error(f"❌ 准备登录页面失败: {str(e)}")
+            self._prepare_login_failures += 1
+            self._log_step("prepare_login.exception", error=str(e), failures=self._prepare_login_failures)
             return {
                 'success': False,
                 'message': f'准备登录页面失败: {str(e)}'
@@ -370,6 +940,7 @@ class BossAutomation:
         """
         try:
             logger.info("📸 获取二维码...")
+            self._log_step("get_qrcode.begin", manual_mode=self.manual_mode)
 
             # 检查浏览器是否初始化
             if not self.page:
@@ -383,10 +954,26 @@ class BossAutomation:
             # 获取当前页面URL
             current_url = self.page.url
             logger.info(f"📍 当前页面: {current_url}")
+            self._log_step("get_qrcode.current_url", current_url=current_url)
 
             # 如果不在登录页面，重新准备登录页面
             if 'zhipin.com/web/user/' not in current_url:
+                if self.manual_mode and (not current_url or current_url == 'about:blank'):
+                    self._log_step("get_qrcode.manual_blank_blocked")
+                    return {
+                        'success': False,
+                        'qrcode': '',
+                        'message': '手动模式页面为空白，请手动访问登录页后再获取二维码'
+                    }
+                if self.manual_mode:
+                    self._log_step("get_qrcode.manual_non_login_blocked", current_url=current_url)
+                    return {
+                        'success': False,
+                        'qrcode': '',
+                        'message': '手动模式下请在浏览器中手动打开登录页后再获取二维码'
+                    }
                 logger.info("⚠️ 当前不在登录页面，重新准备登录页面...")
+                self._log_step("get_qrcode.prepare_login.call")
                 prepare_result = await self.prepare_login_page()
 
                 # 如果准备过程中发现已登录，直接返回
@@ -401,11 +988,13 @@ class BossAutomation:
 
                 # 准备失败
                 if not prepare_result.get('success'):
+                    self._log_step("get_qrcode.prepare_login.failed", message=prepare_result.get('message'))
                     return prepare_result
 
                 # 更新当前URL
                 current_url = self.page.url
                 logger.info(f"📍 准备后页面: {current_url}")
+                self._log_step("get_qrcode.after_prepare", current_url=current_url)
 
             # 检查是否已登录（推荐页面或聊天页面）
             if '/web/chat/' in current_url or '/web/boss/' in current_url or 'geek/recommend' in current_url:
@@ -445,6 +1034,7 @@ class BossAutomation:
             # 如果在登录页面，读取二维码
             if 'zhipin.com/web/user/' in current_url:
                 logger.info("📋 当前在登录页面，读取二维码...")
+                self._log_step("get_qrcode.read_qr.try")
 
                 # 先检查二维码是否过期，如果过期则自动刷新
                 logger.info("🔍 检查二维码是否需要刷新...")
@@ -469,6 +1059,7 @@ class BossAutomation:
                     if qrcode_element:
                         qrcode_src = await qrcode_element.get_attribute('src')
                         logger.info(f"✅ 成功读取二维码")
+                        self._log_step("get_qrcode.read_qr.ok", has_src=bool(qrcode_src))
 
                         # 转换为完整URL
                         if qrcode_src and not qrcode_src.startswith('data:') and not qrcode_src.startswith('http'):
@@ -497,6 +1088,7 @@ class BossAutomation:
             else:
                 # 不在预期页面
                 logger.warning(f"⚠️ 当前不在登录页面: {current_url}")
+                self._log_step("get_qrcode.not_on_login_page", current_url=current_url)
                 return {
                     'success': False,
                     'qrcode': '',
@@ -602,6 +1194,12 @@ class BossAutomation:
             current_url = self.page.url
 
             # 如果页面是空白或未访问Boss直聘,先访问官网首页
+            if self.manual_mode and (not current_url or current_url == 'about:blank' or 'zhipin.com' not in current_url):
+                return {
+                    'logged_in': False,
+                    'user_info': None,
+                    'message': '手动模式下保持当前页面，请手动打开登录页并扫码'
+                }
             if not current_url or current_url == 'about:blank' or 'zhipin.com' not in current_url:
                 logger.info("📍 页面未访问Boss直聘,先访问首页...")
                 await self.page.goto(self.base_url, wait_until='networkidle', timeout=30000)
@@ -752,8 +1350,11 @@ class BossAutomation:
                     logger.info("✅ 登录成功！")
 
                     # 保存登录状态
-                    await self.context.storage_state(path=self.auth_file)
-                    logger.info(f"💾 登录状态已保存: {self.auth_file}")
+                    if self.auth_file:
+                        await self.context.storage_state(path=self.auth_file)
+                        logger.info(f"💾 登录状态已保存: {self.auth_file}")
+                    else:
+                        logger.warning("⚠️ 登录成功但 auth_file 为空，跳过持久化存储")
 
                     self.is_logged_in = True
                     return True
@@ -1623,6 +2224,12 @@ class BossAutomation:
 
             # 更新auth文件路径
             new_auth_file = self.get_auth_file_path(com_id)
+            if not new_auth_file:
+                return {
+                    'success': False,
+                    'message': '登录状态文件路径为空',
+                    'needs_login': True
+                }
 
             # 检查登录状态文件是否存在
             if not os.path.exists(new_auth_file):
@@ -1723,21 +2330,40 @@ class BossAutomation:
         """清理资源，关闭浏览器"""
         logger.info("🔚 清理资源...")
 
-        if self.page:
-            await self.page.close()
-            self.page = None
-
-        if self.context:
-            await self.context.close()
-            self.context = None
-
-        if self.browser:
-            await self.browser.close()
-            self.browser = None
-
-        if self.playwright:
-            await self.playwright.stop()
-            self.playwright = None
+        try:
+            # launch_persistent_context：只关 context 即可，避免先关 page 再关 browser 导致异常/锁残留
+            if self._using_persistent_profile and self.context:
+                await self.context.close()
+                self.context = None
+                self.page = None
+                self.browser = None
+            else:
+                if self.page:
+                    try:
+                        await self.page.close()
+                    except Exception:
+                        pass
+                    self.page = None
+                if self.context:
+                    try:
+                        await self.context.close()
+                    except Exception:
+                        pass
+                    self.context = None
+                if self.browser:
+                    try:
+                        await self.browser.close()
+                    except Exception:
+                        pass
+                    self.browser = None
+        finally:
+            self._using_persistent_profile = False
+            if self.playwright:
+                try:
+                    await self.playwright.stop()
+                except Exception:
+                    pass
+                self.playwright = None
 
         logger.info("✅ 资源清理完成")
 

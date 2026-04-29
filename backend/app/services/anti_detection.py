@@ -44,7 +44,12 @@ class AntiDetection:
         Args:
             page: Playwright Page 对象
         """
-        await page.add_init_script("""
+        import platform as _platform
+        # 保持 UA / platform 一致，避免指纹矛盾触发风控
+        is_windows = _platform.system().lower().startswith("win")
+        platform_value = "Win32" if is_windows else "MacIntel"
+
+        script = """
             // 隐藏 webdriver 标志
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => false
@@ -85,7 +90,7 @@ class AntiDetection:
 
             // 伪造 platform
             Object.defineProperty(navigator, 'platform', {
-                get: () => 'MacIntel'
+                get: () => '__PLATFORM_VALUE__'
             });
 
             // 伪造 hardwareConcurrency
@@ -188,7 +193,9 @@ class AntiDetection:
                 }
                 return originalConsoleDebug.apply(this, arguments);
             };
-        """)
+        """
+
+        await page.add_init_script(script.replace("__PLATFORM_VALUE__", platform_value))
 
     @staticmethod
     async def simulate_mouse_movement(page: Page):

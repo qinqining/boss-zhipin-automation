@@ -42,7 +42,7 @@ export function Settings() {
     toggleFeishu,
     loading,
   } = useConfig();
-  const { getStatus, getQrcode, checkLogin, refreshQrcode } = useAutomation();
+  const { getStatus, initBrowser, getQrcode, checkLogin, refreshQrcode } = useAutomation();
 
   const [config, setConfig] = useState<SystemConfig | null>(null);
   const [automationStatus, setAutomationStatus] = useState<any>(null);
@@ -213,6 +213,12 @@ export function Settings() {
 
   const handleLogin = async () => {
     try {
+      // 设置页登录入口兜底：若浏览器服务未初始化，先初始化
+      const status = await getStatus();
+      if (!status?.service_initialized) {
+        await initBrowser(false, undefined, false);
+      }
+
       // 获取二维码或检查已登录状态
       const result = await getQrcode();
 

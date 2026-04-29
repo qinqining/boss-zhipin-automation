@@ -16,7 +16,8 @@ export default defineConfig({
     host: '0.0.0.0',
     proxy: {
       '/api': {
-        target: 'http://localhost:8998',
+        // 后端默认端口见根目录 start.bat / backend/app/main.py
+        target: 'http://localhost:27421',
         changeOrigin: true,
       },
     },

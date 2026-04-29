@@ -1,6 +1,7 @@
 """
 自动化任务 API 路由
 """
+import asyncio
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +23,7 @@ from app.services.boss_automation import BossAutomation
 from app.services.logging_service import LoggingService
 from app.models.log_entry import LogAction, LogLevel
 from app.utils.filters_applier import FiltersApplier
+from app.services.anti_detection import AntiDetection
 
 router = APIRouter(prefix="/api/automation", tags=["automation"])
 
@@ -29,6 +31,12 @@ router = APIRouter(prefix="/api/automation", tags=["automation"])
 _automation_service: Optional[BossAutomation] = None
 _current_task_id: Optional[int] = None
 _headless: bool = True  # 默认隐藏浏览器
+_last_home_recover_ts: float = 0.0  # 防止轮询导致反复刷新
+_manual_mode: bool = False  # 向导手动模式下避免自动跳转/刷新
+_last_blank_recover_ts: float = 0.0  # 验证链路掉到 blank 时的温和恢复节流
+
+# Playwright 同一 Page 不能并发导航/evaluate；与 init 交错会导致 about:blank 等异常
+_browser_session_lock = asyncio.Lock()
 
 
 async def get_automation_service(headless: Optional[bool] = None) -> BossAutomation:
@@ -44,8 +52,10 @@ async def get_automation_service(headless: Optional[bool] = None) -> BossAutomat
         _headless = headless
 
     if _automation_service is None:
-        _automation_service = BossAutomation()
-        await _automation_service.initialize(headless=_headless)
+        async with _browser_session_lock:
+            if _automation_service is None:
+                _automation_service = BossAutomation()
+                await _automation_service.initialize(headless=_headless)
     return _automation_service
 
 
@@ -471,42 +481,75 @@ async def get_automation_status():
     }
 
 
-@router.get("/check-ready-state")
-async def check_ready_state():
-    """检查浏览器中用户操作的就绪状态（用于手动模式轮询）
+_CHECK_READY_NOT_INITIALIZED = {
+    "ready": False,
+    "logged_in": False,
+    "on_recommend_page": False,
+    "has_frame": False,
+    "user_info": None,
+    "current_url": None,
+    "browser_status": "未初始化",
+    "api_error": None,
+    "message": "浏览器未初始化",
+}
 
-    检测项目：
-    - 浏览器页面是否存在
-    - 是否已登录
-    - 是否在推荐牛人页面
-    - recommendFrame iframe 是否存在
 
-    Returns:
-        就绪状态信息
-    """
-    import logging
-    logger = logging.getLogger(__name__)
-
-    global _automation_service
+async def _check_ready_state_locked_body(logger) -> dict:
+    """在已持有 _browser_session_lock 时执行；与 init 并发会导致 Playwright 页面异常（about:blank）。"""
+    import time
+    global _automation_service, _last_home_recover_ts, _manual_mode, _last_blank_recover_ts
 
     if _automation_service is None or _automation_service.page is None:
-        return {
-            "ready": False,
-            "logged_in": False,
-            "on_recommend_page": False,
-            "has_frame": False,
-            "user_info": None,
-            "message": "浏览器未初始化"
-        }
+        return dict(_CHECK_READY_NOT_INITIALIZED)
 
     page = _automation_service.page
+    page_closed = page.is_closed() if page else True
     logged_in = False
     on_recommend_page = False
     has_frame = False
     user_info = None
+    browser_status = "就绪"
+    api_error = None
 
     try:
+        if page_closed:
+            return {
+                "ready": False,
+                "logged_in": False,
+                "on_recommend_page": False,
+                "has_frame": False,
+                "needs_verification": False,
+                "user_info": None,
+                "current_url": None,
+                "browser_status": "页面已关闭",
+                "api_error": "page_closed",
+                "message": "浏览器页面已关闭，请重新初始化浏览器"
+            }
+
         current_url = page.url
+        logger.info(f"📍 当前URL: {current_url}")
+
+        # 有些情况下浏览器刚启动/页面崩溃会短暂停留在 about:blank，
+        # 这里主动拉起到 Boss 首页，避免前端看到“空白页一直不动”
+        # 但前端会每 3 秒轮询一次，如果每次都 goto 会导致页面反复刷新、影响登录。
+        # 因此加冷却时间：30 秒内最多恢复一次。
+        need_recover = (not current_url) or (current_url == "about:blank") or ("zhipin.com" not in current_url)
+        cooldown_ok = (time.time() - _last_home_recover_ts) > 30
+
+        # 手动模式下完全禁止自动导航，避免打断登录/验证导致刷新循环
+        if _manual_mode and need_recover:
+            logger.info("✋ 手动模式下检测到空白页/非Boss页面，不做自动跳转")
+        elif need_recover and cooldown_ok:
+            try:
+                logger.info("🔄 当前不在 Boss 页面，尝试访问首页以恢复...")
+                await page.goto("https://www.zhipin.com", wait_until="domcontentloaded", timeout=60000)
+                _last_home_recover_ts = time.time()
+                current_url = page.url
+                logger.info(f"📍 恢复后URL: {current_url}")
+            except Exception as e:
+                logger.warning(f"⚠️ 恢复访问首页失败: {str(e)}")
+        elif need_recover and not cooldown_ok:
+            logger.info("⏳ 页面需要恢复但处于冷却期，避免重复刷新")
 
         # 检测是否在推荐牛人页面
         on_recommend_page = 'web/geek/recommend' in current_url or 'chat/recommend' in current_url
@@ -520,28 +563,74 @@ async def check_ready_state():
         # 检测页面是否在验证/登录拦截页（即使 API cookies 有效也不算真正可用）
         is_on_blocked_page = any(kw in current_url for kw in [
             'verify-slider', 'verify-phone', 'safe/verify',
-            'web/user/', 'login', 'captcha'
+            'web/user/', 'login', 'captcha',
+            'passport/zp/verify', '_security_check'
         ])
         if is_on_blocked_page:
             logger.info(f"⚠️ 当前在验证/登录拦截页: {current_url}，需要手动处理")
+            browser_status = "需要验证"
+
+        # 手动模式 + about:blank：直接返回等待手动恢复，避免在空白上下文中执行 fetch
+        if _manual_mode and current_url == "about:blank":
+            return {
+                "ready": False,
+                "logged_in": False,
+                "on_recommend_page": False,
+                "has_frame": False,
+                "needs_verification": True,
+                "user_info": user_info,
+                "current_url": current_url,
+                "browser_status": "等待手动恢复",
+                "api_error": None,
+                "message": "页面进入空白，请在浏览器地址栏手动访问 https://www.zhipin.com 后继续验证"
+            }
 
         # 检测登录状态（通过 API）
         try:
+            # 在验证拦截页上接口经常返回 HTML（非 JSON），这里跳过 API 检查避免噪音和误判
+            if is_on_blocked_page:
+                return {
+                    "ready": False,
+                    "logged_in": False,
+                    "on_recommend_page": on_recommend_page,
+                    "has_frame": has_frame,
+                    "needs_verification": True,
+                    "user_info": user_info,
+                    "current_url": current_url,
+                    "browser_status": browser_status,
+                    "api_error": None,
+                    "message": "⚠️ 当前处于安全验证流程，请先在浏览器完成验证"
+                }
+
             api_url = "https://www.zhipin.com/wapi/zpboss/h5/user/info"
             response = await page.evaluate(f'''
                 async () => {{
                     try {{
-                        const response = await fetch("{api_url}");
+                        const response = await fetch("{api_url}", {{
+                            method: 'GET',
+                            credentials: 'include',
+                            headers: {{
+                                'Content-Type': 'application/json'
+                            }}
+                        }});
+                        if (!response.ok) {{
+                            return {{ code: -2, error: 'HTTP ' + response.status }};
+                        }}
                         return await response.json();
                     }} catch(e) {{
-                        return {{ code: -1 }};
+                        return {{ code: -1, error: e.message }};
                     }}
                 }}
             ''')
 
-            logger.info(f"🔍 check-ready-state API code={response.get('code')}, on_blocked={is_on_blocked_page}")
+            error_code = response.get('code', -1)
+            logger.info(f"🔍 check-ready-state API code={error_code}, on_blocked={is_on_blocked_page}")
+            
+            if error_code != 0:
+                api_error = response.get('error', '未知错误')
+                logger.warning(f"⚠️ API调用返回错误: code={error_code}, error={api_error}")
 
-            if response.get('code') == 0:
+            if error_code == 0:
                 zp_data = response.get('zpData', {})
                 base_info = zp_data.get('baseInfo', {})
                 com_id = base_info.get('comId')
@@ -558,6 +647,7 @@ async def check_ready_state():
                         'title': base_info.get('title'),
                     }
                     logger.info(f"✅ 已登录: {base_info.get('showName')} (comId={com_id})")
+                    browser_status = "已登录"
 
                     # 保存认证状态
                     if not _automation_service.auth_file:
@@ -585,12 +675,30 @@ async def check_ready_state():
                         'title': base_info.get('title'),
                     }
                     logger.info(f"⚠️ API 有效但在拦截页，需先完成验证: {base_info.get('showName')}")
+                    browser_status = "已登录-需要验证"
                 else:
                     logger.info("⚠️ API code=0 但无 comId，未登录")
+                    browser_status = "未登录"
         except Exception as e:
-            logger.warning(f"⚠️ 检查登录状态失败: {str(e)}")
+            api_error = str(e)
+            logger.warning(f"⚠️ 检查登录状态异常: {api_error}")
+            browser_status = "API检查失败"
 
         ready = logged_in and on_recommend_page and has_frame
+
+        # 生成友好的消息提示
+        if ready:
+            message = "✅ 所有条件已满足，可以开始打招呼"
+        elif is_on_blocked_page:
+            message = "⚠️ 需要在浏览器中完成安全验证，完成后自动继续"
+        elif not logged_in:
+            message = "📱 请在浏览器中扫码或登录"
+        elif not on_recommend_page:
+            message = "🔍 请在浏览器中导航到推荐牛人页面"
+        elif not has_frame:
+            message = "⏳ 页面加载中，请稍候..."
+        else:
+            message = "⏳ 等待中..."
 
         return {
             "ready": ready,
@@ -600,19 +708,42 @@ async def check_ready_state():
             "needs_verification": is_on_blocked_page,
             "user_info": user_info,
             "current_url": current_url,
-            "message": "就绪" if ready else ("请在浏览器中完成安全验证" if is_on_blocked_page else "等待用户操作")
+            "browser_status": browser_status,
+            "api_error": api_error,
+            "message": message
         }
 
     except Exception as e:
-        logger.error(f"❌ 检查就绪状态失败: {str(e)}")
+        logger.error(f"❌ 检查就绪状态异常: {str(e)}", exc_info=True)
         return {
             "ready": False,
             "logged_in": False,
             "on_recommend_page": False,
             "has_frame": False,
             "user_info": None,
+            "current_url": None,
+            "browser_status": "异常",
+            "api_error": str(e),
             "message": f"检查失败: {str(e)}"
         }
+
+
+@router.get("/check-ready-state")
+async def check_ready_state():
+    """检查浏览器中用户操作的就绪状态（用于手动模式轮询）
+
+    与 /init 共用锁，避免 Playwright 同一 Page 上并发 goto / evaluate 导致 about:blank。
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    global _automation_service
+
+    if _automation_service is None or _automation_service.page is None:
+        return dict(_CHECK_READY_NOT_INITIALIZED)
+
+    async with _browser_session_lock:
+        return await _check_ready_state_locked_body(logger)
 
 
 @router.post("/init")
@@ -635,20 +766,28 @@ async def initialize_browser(
     logger = logging.getLogger(__name__)
     logger.info(f"🔧 初始化浏览器 - headless={headless} (类型: {type(headless).__name__}), com_id={com_id}, manual_mode={manual_mode}")
 
-    global _automation_service, _headless
+    global _automation_service, _headless, _manual_mode
 
-    # 如果已经初始化，先清理
-    if _automation_service is not None:
-        await _automation_service.cleanup()
-        _automation_service = None
+    async with _browser_session_lock:
+        if _automation_service is not None:
+            await _automation_service.cleanup()
+            _automation_service = None
 
-    # 设置 headless 模式
-    _headless = headless
-    logger.info(f"🔧 设置全局 _headless={_headless}")
+        _headless = headless
+        logger.info(f"🔧 设置全局 _headless={_headless}")
+        _manual_mode = manual_mode
 
-    # 创建自动化服务实例，如果指定了com_id则使用该账号
-    _automation_service = BossAutomation(com_id=com_id)
-    await _automation_service.initialize(headless=headless, skip_auto_navigate=manual_mode)
+        svc = BossAutomation(com_id=com_id)
+        initialized = await svc.initialize(headless=headless, skip_auto_navigate=manual_mode)
+        if not initialized:
+            try:
+                await svc.cleanup()
+            except Exception:
+                pass
+            _automation_service = None
+            raise HTTPException(status_code=500, detail="浏览器启动成功，但无法打开 Boss 页面，请检查网络/IP风控后重试")
+
+        _automation_service = svc
 
     return {
         "success": True,
@@ -663,13 +802,14 @@ async def initialize_browser(
 @router.post("/login")
 async def trigger_login():
     """触发登录流程"""
-    automation = await get_automation_service()
+    async with _browser_session_lock:
+        automation = await get_automation_service()
 
-    if automation.is_logged_in:
-        return {"message": "已登录", "logged_in": True}
+        if automation.is_logged_in:
+            return {"message": "已登录", "logged_in": True}
 
-    # 启动登录流程
-    is_logged_in = await automation.check_and_login()
+        # 启动登录流程
+        is_logged_in = await automation.check_and_login()
 
     return {
         "message": "登录成功" if is_logged_in else "登录失败",
@@ -677,24 +817,50 @@ async def trigger_login():
     }
 
 
+@router.post("/recover-homepage")
+async def recover_homepage():
+    """当页面变成 about:blank 时手动恢复到 Boss 首页"""
+    global _automation_service
+
+    if _automation_service is None or _automation_service.page is None:
+        raise HTTPException(status_code=400, detail="浏览器未初始化")
+
+    async with _browser_session_lock:
+        if _automation_service is None or _automation_service.page is None:
+            raise HTTPException(status_code=400, detail="浏览器未初始化")
+        page = _automation_service.page
+        current_url = page.url or ""
+
+        if "zhipin.com" in current_url and current_url != "about:blank":
+            return {"success": True, "message": "当前页面正常，无需恢复", "current_url": current_url}
+
+        try:
+            await page.goto("https://www.zhipin.com", wait_until="domcontentloaded", timeout=60000)
+            await AntiDetection.random_sleep(0.5, 1.2)
+            return {"success": True, "message": "已恢复到 Boss 首页", "current_url": page.url}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"恢复首页失败: {str(e)}")
+
+
 @router.get("/qrcode")
 async def get_qrcode():
     """获取登录二维码"""
-    automation = await get_automation_service()
+    async with _browser_session_lock:
+        automation = await get_automation_service()
 
-    # 直接调用 get_qrcode，让它自己判断是否需要二维码
-    # 不在路由层面检查 is_logged_in，因为这个标志可能过期
-    result = await automation.get_qrcode()
+        # 直接调用 get_qrcode，让它自己判断是否需要二维码
+        # 不在路由层面检查 is_logged_in，因为这个标志可能过期
+        result = await automation.get_qrcode()
     return result
 
 
 @router.get("/check-login")
 async def check_login(session: AsyncSession = Depends(get_session)):
     """检查登录状态并获取用户信息"""
-    automation = await get_automation_service()
-
-    # 检查登录状态
-    result = await automation.check_login_status()
+    async with _browser_session_lock:
+        automation = await get_automation_service()
+        # 检查登录状态
+        result = await automation.check_login_status()
 
     # 如果登录成功，记录日志
     if result.get('logged_in'):
@@ -718,10 +884,10 @@ async def check_login(session: AsyncSession = Depends(get_session)):
 @router.get("/refresh-qrcode")
 async def refresh_qrcode():
     """检查并刷新二维码"""
-    automation = await get_automation_service()
-
-    # 检查并刷新二维码
-    result = await automation.check_and_refresh_qrcode()
+    async with _browser_session_lock:
+        automation = await get_automation_service()
+        # 检查并刷新二维码
+        result = await automation.check_and_refresh_qrcode()
     return result
 
 
@@ -743,9 +909,10 @@ async def cleanup_service():
     if _current_task_id is not None:
         raise HTTPException(status_code=400, detail="有任务正在运行，无法清理")
 
-    if _automation_service:
-        await _automation_service.cleanup()
-        _automation_service = None
+    async with _browser_session_lock:
+        if _automation_service:
+            await _automation_service.cleanup()
+            _automation_service = None
 
     return {"message": "服务已清理"}
 

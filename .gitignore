@@ -98,3 +98,4 @@ electron-app/backend-dist/
 electron-app/*.dmg
 electron-app/*.app
 electron-app/*.zip
+backend/.boss_chrome_profile/

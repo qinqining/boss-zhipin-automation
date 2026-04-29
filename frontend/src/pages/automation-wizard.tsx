@@ -746,22 +746,52 @@ export default function AutomationWizard() {
             )}
           </div>
 
-          {/* 继续按钮 */}
-          <Button
-            onClick={() => setCurrentStep('confirm')}
-            disabled={!allReady}
-            className="w-full"
-            size="lg"
-          >
-            {allReady ? (
-              <>
-                <CheckCircle2 className="mr-2 h-4 w-4" />
-                继续配置
-              </>
-            ) : (
-              '请先完成上述操作'
-            )}
-          </Button>
+          {/* 按钮组 */}
+          <div className="flex gap-3 justify-between">
+            <Button
+              variant="outline"
+              onClick={() => {
+                if (readyPollingRef.current) {
+                  clearInterval(readyPollingRef.current);
+                }
+                setCurrentStep('browser');
+              }}
+            >
+              ← 返回
+            </Button>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                onClick={() => {
+                  if (readyPollingRef.current) {
+                    clearInterval(readyPollingRef.current);
+                  }
+                  startReadyStatePolling();
+                }}
+              >
+                🔄 手动刷新
+              </Button>
+              <Button
+                onClick={() => {
+                  if (readyPollingRef.current) {
+                    clearInterval(readyPollingRef.current);
+                  }
+                  setCurrentStep('confirm');
+                }}
+                disabled={!allReady}
+                size="lg"
+              >
+                {allReady ? (
+                  <>
+                    <CheckCircle2 className="mr-2 h-4 w-4" />
+                    继续配置
+                  </>
+                ) : (
+                  '请先完成上述操作'
+                )}
+              </Button>
+            </div>
+          </div>
         </CardContent>
       </Card>
     );
